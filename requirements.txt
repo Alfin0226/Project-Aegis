@@ -1,0 +1,4 @@
+pandas==2.3.3
+numpy==2.3.5
+alpaca-py>=0.13.0
+python-dotenv>=1.0.0
