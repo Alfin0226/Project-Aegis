@@ -4,7 +4,7 @@ Closed-source algorithmic trading system for probability-based signal generation
 
 ## Live Dashboard
 
-**[View Dashboard](https://your-dashboard-link-here)**
+**[View Dashboard](https://alfin0226.github.io/Project-Aegis/)**
 
 The dashboard is updated automatically and displays current paper-trading performance, open positions, equity history, and trade statistics.
 
