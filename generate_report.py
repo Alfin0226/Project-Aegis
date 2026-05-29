@@ -739,8 +739,8 @@ def generate_html(account_metrics, risk_metrics, trade_stats, positions_df, char
     <!-- ── Top cards ── -->
     <div class="cards">
         <div class="card"><div class="label">Balance (Equity)</div><div class="value">{fmt_money(account_metrics['equity'])}</div></div>
-        <div class="card"><div class="label">Sharpe Ratio (30D)</div><div class="value">{risk_metrics['sharpe']:.2f}</div></div>
-        <div class="card"><div class="label">Max Drawdown (30D)</div><div class="value {mdd_class}">{risk_metrics['max_drawdown_pct']:.2f}%</div></div>
+        <div class="card"><div class="label">Sharpe Ratio</div><div class="value">{risk_metrics['sharpe']:.2f}</div></div>
+        <div class="card"><div class="label">Max Drawdown</div><div class="value {mdd_class}">{risk_metrics['max_drawdown_pct']:.2f}%</div></div>
         <div class="card"><div class="label">Daily P/L</div><div class="value {daily_pl_class}">{fmt_money(account_metrics['daily_pl'])}</div></div>
     </div>
 
@@ -950,10 +950,10 @@ def main():
             raw_histories[cfg["key"]] = pd.DataFrame()
 
     # Reuse already-fetched data for risk metrics
-    history_30d_df = raw_histories.get("1M", pd.DataFrame())
+    history_all_df = raw_histories.get("All", pd.DataFrame())
     history_24h_df = raw_histories.get("1D", pd.DataFrame())
 
-    risk_metrics = calculate_risk_metrics(history_30d_df)
+    risk_metrics = calculate_risk_metrics(history_all_df)
     peak_equity_24h = (
         float(history_24h_df["equity"].max()) if not history_24h_df.empty else equity
     )
