@@ -321,33 +321,113 @@ def build_roundtrips_from_orders(filled_orders, positions):
 
     return roundtrips
 
-def generate_trade_history_html(roundtrips):
-    """Generate dark-themed HTML tables for each stock's roundtrip trades + overall summary."""
+def generate_trade_history_html(roundtrips, master_rows):
+    """Generate accordion-based HTML for each stock's roundtrip trades + overall summary."""
     css = """
     <style>
         .th-section { margin-top: 32px; }
-        .th-header { font-size: 20px; font-weight: 600; margin-bottom: 16px; border-bottom: 2px solid #1e2a44; padding-bottom: 8px; }
-        .th-symbol-header { font-size: 18px; margin-top: 24px; color: #3b82f6; border-left: 4px solid #3b82f6; padding-left: 10px; }
-        .th-pool-label { font-size: 14px; color: #94a3b8; margin: 4px 0 12px 0; font-weight: normal; }
-        .th-table-wrap { background: #111b2e; border: 1px solid #1e2a44; border-radius: 8px; overflow: hidden; margin-bottom: 16px; }
+        .th-header { font-size: 18px; font-weight: 600; margin-bottom: 16px; border-bottom: 2px solid #1e2d44; padding-bottom: 8px; color: #f8fafc; }
+        
+        details.stock-accordion {
+            margin-bottom: 10px;
+            border-radius: 6px;
+            overflow: hidden;
+            border: 1px solid #1d2d44;
+            background: #0e1622;
+        }
+        details.stock-accordion summary::-webkit-details-marker {
+            display: none;
+        }
+        details.stock-accordion summary {
+            list-style: none;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 14px 18px;
+            cursor: pointer;
+            user-select: none;
+            transition: all 0.2s;
+        }
+        details.stock-accordion summary:hover {
+            background: #162235;
+            border-color: #3b82f6;
+        }
+        details.stock-accordion[open] summary {
+            background: #162235;
+            border-bottom: 1px solid #1d2d44;
+        }
+        .accordion-content {
+            background: #090e17;
+            padding: 20px;
+        }
+        .acc-left {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+        .acc-symbol {
+            font-size: 18px;
+            font-weight: 700;
+            color: #f8fafc;
+        }
+        .acc-badge {
+            font-size: 10px;
+            font-weight: 600;
+            padding: 2px 6px;
+            border-radius: 4px;
+            background: rgba(59, 130, 246, 0.12);
+            color: #3b82f6;
+            border: 1px solid rgba(59, 130, 246, 0.25);
+        }
+        .acc-right {
+            display: flex;
+            align-items: center;
+            gap: 32px;
+        }
+        .acc-pnl-wrap, .acc-wr-wrap, .acc-open-wrap {
+            display: flex;
+            flex-direction: column;
+            align-items: flex-end;
+        }
+        .acc-label {
+            font-size: 9px;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            color: #64748b;
+            margin-bottom: 3px;
+        }
+        .acc-val {
+            font-size: 14px;
+            font-weight: 600;
+        }
+        .chevron {
+            color: #64748b;
+            transition: transform 0.2s;
+            font-size: 11px;
+        }
+        details.stock-accordion[open] .chevron {
+            transform: rotate(90deg);
+        }
+        
+        .th-table-wrap { background: #0e1622; border: 1px solid #1d2d44; border-radius: 6px; overflow: hidden; margin-bottom: 16px; }
         .th-table { width: 100%; border-collapse: collapse; }
-        .th-table th { background: #0f172a; color: #cbd5e1; font-weight: 600; padding: 10px; text-align: left; font-size: 12px; white-space: nowrap; border-bottom: 1px solid #1e2a44; }
-        .th-table td { padding: 8px 10px; border-bottom: 1px solid #1e2a44; font-size: 13px; white-space: nowrap; }
-        .th-table tbody tr:hover { background: #1e293b; }
-        .pnl-pos { color: #22c55e; font-weight: 600; }
-        .pnl-neg { color: #ef4444; font-weight: 600; }
+        .th-table th { background: #0a0f18; color: #cbd5e1; font-weight: 600; padding: 10px; text-align: left; font-size: 12px; white-space: nowrap; border-bottom: 1px solid #1d2d44; }
+        .th-table td { padding: 9px 10px; border-bottom: 1px solid #1d2d44; font-size: 13px; white-space: nowrap; color: #e2e8f0; }
+        .th-table tbody tr:hover { background: #162235; }
+        .pnl-pos { color: #10b981; font-weight: 600; }
+        .pnl-neg { color: #f43f5e; font-weight: 600; }
         .pnl-open { color: #94a3b8; font-style: italic; }
         .reason-badge { padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 500; display: inline-block; }
-        .reason-stop { background: rgba(239,68,68,0.15); color: #fca5a5; border: 1px solid rgba(239,68,68,0.3); }
-        .reason-exit { background: rgba(245,158,11,0.15); color: #fcd34d; border: 1px solid rgba(245,158,11,0.3); }
-        .reason-open { background: rgba(34,197,94,0.15); color: #86efac; border: 1px solid rgba(34,197,94,0.3); }
-        .summary-wrap { background: #0f172a; padding: 10px; border-top: 1px solid #1e2a44; }
+        .reason-stop { background: rgba(244,63,94,0.12); color: #fca5a5; border: 1px solid rgba(244,63,94,0.25); }
+        .reason-exit { background: rgba(245,158,11,0.12); color: #fcd34d; border: 1px solid rgba(245,158,11,0.25); }
+        .reason-open { background: rgba(16,185,129,0.12); color: #86efac; border: 1px solid rgba(16,185,129,0.25); }
+        .summary-wrap { background: #0a0f18; padding: 12px; border-radius: 6px; border: 1px solid #1d2d44; }
         .summary-table { width: 100%; border-collapse: collapse; }
-        .summary-table th { color: #94a3b8; font-size: 11px; text-align: center; padding: 4px; border: none; background: transparent; }
-        .summary-table td { text-align: center; font-size: 13px; font-weight: 500; padding: 4px; border: none; }
+        .summary-table th { color: #64748b; font-size: 11px; text-align: center; padding: 4px; border: none; background: transparent; text-transform: uppercase; letter-spacing: 0.05em; }
+        .summary-table td { text-align: center; font-size: 13px; font-weight: 600; padding: 4px; border: none; }
         .master-summary { margin-top: 40px; }
-        .master-table th { background: #1e293b; color: #f8fafc; font-size: 12px; }
-        .total-row td { background: #1e293b; font-weight: bold; border-top: 2px solid #334155; }
+        .master-table th { background: #0a0f18; color: #f8fafc; font-size: 12px; text-transform: uppercase; letter-spacing: 0.05em; }
+        .total-row td { background: #0e1622; font-weight: bold; border-top: 2px solid #1d2d44; color: #f8fafc; }
     </style>
     """
 
@@ -355,7 +435,6 @@ def generate_trade_history_html(roundtrips):
         if not d: return '—'
         if isinstance(d, datetime):
             return d.strftime('%Y-%m-%d')
-        # Handle string dates from alpaca if any
         return str(d)[:10]
 
     def fmt_price(p):
@@ -380,14 +459,51 @@ def generate_trade_history_html(roundtrips):
     html_parts = [css, '<div class="th-section">']
     html_parts.append('<div class="th-header">Per-Stock Trade History</div>')
 
-    master_rows = []
+    row_map = {r['symbol']: r for r in master_rows}
 
     for symbol in sorted(roundtrips.keys()):
         rts = roundtrips[symbol]
+        row_data = row_map.get(symbol, {})
+        
         pool = rts[0].get('pool', '—') if rts else '—'
+        total_pnl = row_data.get('total_pnl', 0.0)
+        win_rate = row_data.get('win_rate', 0.0)
+        n_closed = row_data.get('closed', 0)
+        n_open = row_data.get('open', 0)
+        
+        pnl_cls = 'pnl-pos' if total_pnl >= 0 else 'pnl-neg'
+        pnl_sign = '+' if total_pnl >= 0 else ''
+        pnl_str = f"{pnl_sign}${total_pnl:,.2f}"
+        
+        wr_cls = 'pnl-pos' if win_rate >= 50 else ('pnl-neg' if n_closed > 0 else '')
+        wr_str = f"{win_rate:.0f}%" if n_closed > 0 else '—'
 
-        html_parts.append(f'<div class="th-symbol-header">{symbol}</div>')
-        html_parts.append(f'<div class="th-pool-label">Pool: {pool} &mdash; {len(rts)} roundtrip(s)</div>')
+        html_parts.append(f"""
+        <details class="stock-accordion">
+            <summary>
+                <div class="acc-left">
+                    <span class="chevron">▶</span>
+                    <span class="acc-symbol">{symbol}</span>
+                    <span class="acc-badge">{pool}</span>
+                </div>
+                <div class="acc-right">
+                    <div class="acc-pnl-wrap">
+                        <span class="acc-label">Net P&amp;L</span>
+                        <span class="acc-val {pnl_cls}">{pnl_str}</span>
+                    </div>
+                    <div class="acc-wr-wrap">
+                        <span class="acc-label">Win Rate</span>
+                        <span class="acc-val {wr_cls}">{wr_str}</span>
+                    </div>
+                    <div class="acc-open-wrap">
+                        <span class="acc-label">Trades</span>
+                        <span class="acc-val">{n_closed} closed {f'/ {n_open} open' if n_open > 0 else ''}</span>
+                    </div>
+                </div>
+            </summary>
+            <div class="accordion-content">
+        """)
+
         html_parts.append('<div class="th-table-wrap"><table class="th-table">')
         html_parts.append(
             '<thead><tr><th>#</th><th>Entry Date</th><th>Exit Date</th>'
@@ -399,7 +515,6 @@ def generate_trade_history_html(roundtrips):
         wins = [r for r in closed if r['pnl'] >= 0]
         losses = [r for r in closed if r['pnl'] < 0]
         stops = [r for r in closed if 'Stop' in r['exit_reason']]
-        n_open = sum(1 for r in rts if r['pnl'] is None)
 
         for i, rt in enumerate(rts, 1):
             qty_str = f'{rt["qty"]:,.2f}' if rt['qty'] else '—'
@@ -416,10 +531,8 @@ def generate_trade_history_html(roundtrips):
                 f'</tr>'
             )
 
-        html_parts.append('</tbody></table>')
+        html_parts.append('</tbody></table></div>')
 
-        total_pnl = sum(r['pnl'] for r in closed) if closed else 0
-        win_rate = (len(wins) / len(closed) * 100) if closed else 0
         avg_win = sum(r['pnl'] for r in wins)/len(wins) if wins else 0
         avg_loss = sum(r['pnl'] for r in losses)/len(losses) if losses else 0
 
@@ -429,7 +542,6 @@ def generate_trade_history_html(roundtrips):
             '<th>Stops</th><th>Open</th><th>Win Rate</th>'
             '<th>Avg Win</th><th>Avg Loss</th><th>Net P&amp;L</th></tr></thead><tbody>'
         )
-        wr_cls = 'pnl-pos' if win_rate >= 50 else 'pnl-neg'
         pnl_cls = 'pnl-pos' if total_pnl >= 0 else 'pnl-neg'
         pnl_sign = '+' if total_pnl >= 0 else ''
         html_parts.append(
@@ -445,19 +557,11 @@ def generate_trade_history_html(roundtrips):
             f'<td class="{pnl_cls}">{pnl_sign}${total_pnl:,.2f}</td>'
             f'</tr>'
         )
-        html_parts.append('</tbody></table></div></div>')
-
-        master_rows.append({
-            'symbol': symbol, 'pool': pool,
-            'total': len(rts), 'closed': len(closed),
-            'wins': len(wins), 'losses': len(losses),
-            'stops': len(stops), 'open': n_open,
-            'win_rate': win_rate, 'total_pnl': total_pnl,
-        })
+        html_parts.append('</tbody></table></div></div></details>')
 
     # --- Master Summary ---
     html_parts.append('<div class="master-summary">')
-    html_parts.append('<div class="th-header">Overall Stock Summary</div>')
+    html_parts.append('<div class="th-header">Overall Stock Summary Table</div>')
     html_parts.append('<div class="th-table-wrap"><table class="th-table master-table">')
     html_parts.append(
         '<thead><tr><th>Stock</th><th>Pool</th><th>Total</th><th>Closed</th>'
@@ -469,7 +573,7 @@ def generate_trade_history_html(roundtrips):
     grand_pnl = 0.0
 
     for row in sorted(master_rows, key=lambda r: r['total_pnl'], reverse=True):
-        wr_cls = 'pnl-pos' if row['win_rate'] >= 50 else 'pnl-neg'
+        wr_cls = 'pnl-pos' if row['win_rate'] >= 50 else ('pnl-neg' if row['closed'] > 0 else '')
         pnl_cls = 'pnl-pos' if row['total_pnl'] >= 0 else 'pnl-neg'
         pnl_sign = '+' if row['total_pnl'] >= 0 else ''
         
@@ -519,65 +623,25 @@ def generate_trade_history_html(roundtrips):
 
 
 def generate_equity_table_html(daily_history_df):
-    """Generate a day-to-day equity value HTML table from the daily history DataFrame."""
-    if daily_history_df.empty or len(daily_history_df) < 2:
-        return '<div class="panel" style="margin-top:16px;"><h3>Daily Equity History</h3><p class="note">Not enough data to display daily equity history.</p></div>'
-
-    df = daily_history_df.copy()
-    df = df.sort_values('timestamp').reset_index(drop=True)
-    df['equity'] = df['equity'].astype(float)
-
-    # Calculate daily change and cumulative return
-    df['daily_change'] = df['equity'].diff()
-    df['daily_change_pct'] = df['equity'].pct_change() * 100
-    first_equity = df['equity'].iloc[0]
-    df['cumulative_return'] = ((df['equity'] / first_equity) - 1) * 100
-
-    # Build rows (newest first)
-    rows_html = ''
-    for _, row in df.iloc[::-1].iterrows():
-        date_str = row['timestamp'].strftime('%Y-%m-%d')
-        eq_str = f"${row['equity']:,.2f}"
-
-        if pd.isna(row['daily_change']):
-            chg_str = '—'
-            chg_pct_str = '—'
-            chg_cls = ''
-        else:
-            chg = row['daily_change']
-            chg_pct = row['daily_change_pct']
-            chg_cls = 'pnl-pos' if chg >= 0 else 'pnl-neg'
-            sign = '+' if chg >= 0 else ''
-            chg_str = f'{sign}${chg:,.2f}'
-            chg_pct_str = f'{sign}{chg_pct:.2f}%'
-
-        cum_ret = row['cumulative_return']
-        cum_cls = 'pnl-pos' if cum_ret >= 0 else 'pnl-neg'
-        cum_sign = '+' if cum_ret >= 0 else ''
-        cum_str = f'{cum_sign}{cum_ret:.2f}%'
-
-        rows_html += f'''<tr>
-            <td>{date_str}</td>
-            <td>{eq_str}</td>
-            <td class="{chg_cls}">{chg_str}</td>
-            <td class="{chg_cls}">{chg_pct_str}</td>
-            <td class="{cum_cls}">{cum_str}</td>
-        </tr>\n'''
-
-    html = f'''
-    <div class="equity-history-section" style="margin-top:32px;">
-        <div class="th-header">Daily Equity History</div>
-        <div class="th-table-wrap">
-            <table class="th-table" id="equityHistoryTable">
-                <thead><tr>
-                    <th>Date</th>
-                    <th>Equity</th>
-                    <th>Daily Change ($)</th>
-                    <th>Daily Change (%)</th>
-                    <th>Cumulative Return</th>
-                </tr></thead>
-                <tbody>{rows_html}</tbody>
-            </table>
+    """Generate the daily performance heatmap container placeholder."""
+    html = '''
+    <div class="panel heatmap-panel" style="margin-top: 32px;">
+        <div class="th-header">Daily Returns Heatmap</div>
+        <div class="heatmap-wrapper">
+            <div id="heatmapGrid" class="heatmap-grid"></div>
+        </div>
+        <div class="heatmap-legend">
+            <span class="legend-text">Significant Loss</span>
+            <div class="legend-scale">
+                <div class="legend-cell" style="background: rgba(244, 63, 94, 0.95)"></div>
+                <div class="legend-cell" style="background: rgba(244, 63, 94, 0.65)"></div>
+                <div class="legend-cell" style="background: rgba(244, 63, 94, 0.35)"></div>
+                <div class="legend-cell" style="background: #1e293b"></div>
+                <div class="legend-cell" style="background: rgba(16, 185, 129, 0.35)"></div>
+                <div class="legend-cell" style="background: rgba(16, 185, 129, 0.65)"></div>
+                <div class="legend-cell" style="background: rgba(16, 185, 129, 0.95)"></div>
+            </div>
+            <span class="legend-text">Significant Profit</span>
         </div>
     </div>
     '''
@@ -627,13 +691,12 @@ def fmt_pct(value):
     return f"{value:+,.2f}%"
 
 
-def generate_html(account_metrics, risk_metrics, trade_stats, positions_df, chart_data_json, trade_history_html, equity_table_html):
+def generate_html(account_metrics, risk_metrics, trade_stats, positions_df, chart_data_json, trade_history_html, equity_table_html, heatmap_data_json, master_rows):
     now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
     daily_pl_class = "green" if account_metrics["daily_pl"] >= 0 else "red"
     mdd_class = "green" if risk_metrics["max_drawdown_pct"] >= -5 else "red"
 
-    # Trade stats explanation
     total_closed = trade_stats["win_trades"] + trade_stats["loss_trades"]
     if total_closed == 0 and account_metrics["ongoing_trades"] > 0:
         trade_note = (
@@ -645,7 +708,7 @@ def generate_html(account_metrics, risk_metrics, trade_stats, positions_df, char
     else:
         trade_note = ""
 
-    # Position rows
+    # Position rows with unrealized P&L double-sided progress bar
     position_rows = ""
     if positions_df.empty:
         position_rows = (
@@ -656,19 +719,126 @@ def generate_html(account_metrics, risk_metrics, trade_stats, positions_df, char
         for _, row in positions_df.iterrows():
             pl_class = "green" if row["unrealized_pl"] >= 0 else "red"
             change_class = "green" if row["change_today"] >= 0 else "red"
+            
+            pnl_pc = row['unrealized_plpc']
+            clamped = max(-10.0, min(10.0, pnl_pc))
+            if clamped >= 0:
+                bar_class = "pos"
+                bar_width = (clamped / 10.0) * 50
+                bar_margin = 50
+            else:
+                bar_class = "neg"
+                bar_width = (abs(clamped) / 10.0) * 50
+                bar_margin = 50 - bar_width
+                
             position_rows += f"""
             <tr>
-                <td>{row['symbol']}</td>
-                <td>{row['side']}</td>
+                <td><strong>{row['symbol']}</strong></td>
+                <td><span class="side-badge">{row['side']}</span></td>
                 <td>{row['qty']:,.4f}</td>
                 <td>{fmt_money(row['market_value'])}</td>
                 <td>{fmt_money(row['avg_entry_price'])}</td>
                 <td>{fmt_money(row['current_price'])}</td>
                 <td class="{pl_class}">{fmt_money(row['unrealized_pl'])}</td>
-                <td class="{pl_class}">{fmt_pct(row['unrealized_plpc'])}</td>
+                <td class="{pl_class}">
+                    <div class="pnl-progress-flex">
+                        <span class="pnl-pc-text">{fmt_pct(row['unrealized_plpc'])}</span>
+                        <div class="pnl-progress-track">
+                            <div class="pnl-progress-bar {bar_class}" style="width: {bar_width:.1f}%; margin-left: {bar_margin:.1f}%;"></div>
+                            <div class="pnl-progress-center"></div>
+                        </div>
+                    </div>
+                </td>
                 <td class="{change_class}">{fmt_pct(row['change_today'])}</td>
             </tr>
             """
+
+    # --- P&L Attribution Breakdown HTML ---
+    pos_stocks = [r for r in master_rows if r['total_pnl'] > 0]
+    total_gains = sum(r['total_pnl'] for r in pos_stocks)
+    
+    attribution_html = ""
+    if total_gains == 0:
+        attribution_html = '<p class="note">No positive closed P&L to attribute yet.</p>'
+    else:
+        sorted_pos = sorted(pos_stocks, key=lambda x: x['total_pnl'], reverse=True)
+        attribution_html += '<div class="attribution-list">'
+        for r in sorted_pos[:6]:
+            pct = (r['total_pnl'] / total_gains) * 100.0
+            attribution_html += f"""
+            <div class="attrib-row">
+                <div class="attrib-meta">
+                    <span class="attrib-sym"><strong>{r['symbol']}</strong></span>
+                    <span class="attrib-val green">+{fmt_money(r['total_pnl'])}</span>
+                </div>
+                <div class="attrib-progress-container">
+                    <div class="attrib-progress-bar" style="width: {pct:.1f}%"></div>
+                    <span class="attrib-pct">{pct:.1f}%</span>
+                </div>
+            </div>
+            """
+        if len(sorted_pos) > 6:
+            other_gains = sum(r['total_pnl'] for r in sorted_pos[6:])
+            other_pct = (other_gains / total_gains) * 100.0
+            attribution_html += f"""
+            <div class="attrib-row">
+                <div class="attrib-meta">
+                    <span class="attrib-sym"><strong>Others</strong></span>
+                    <span class="attrib-val green">+{fmt_money(other_gains)}</span>
+                </div>
+                <div class="attrib-progress-container">
+                    <div class="attrib-progress-bar" style="width: {other_pct:.1f}%; background: #475569;"></div>
+                    <span class="attrib-pct">{other_pct:.1f}%</span>
+                </div>
+            </div>
+            """
+        attribution_html += '</div>'
+
+    # --- Horizontal Stock Summary Bar Chart ---
+    sorted_master = sorted(master_rows, key=lambda x: x['total_pnl'], reverse=True)
+    max_abs_pnl = max(abs(r['total_pnl']) for r in master_rows) if master_rows else 1.0
+    if max_abs_pnl == 0.0:
+        max_abs_pnl = 1.0
+        
+    bar_chart_html = """
+    <div class="panel bar-chart-panel">
+        <h3>Asset Net P&amp;L Performance</h3>
+        <div class="bar-chart-container">
+    """
+    for r in sorted_master:
+        pnl = r['total_pnl']
+        pnl_pct_of_max = (abs(pnl) / max_abs_pnl) * 50.0
+        
+        pnl_val_str = f"+${pnl:,.2f}" if pnl >= 0 else f"-${abs(pnl):,.2f}"
+        pnl_class = "green" if pnl >= 0 else "red"
+        
+        if pnl >= 0:
+            bar_style = f"width: {pnl_pct_of_max:.1f}%; margin-left: 50%;"
+            bar_color_class = "bar-pos"
+        else:
+            bar_style = f"width: {pnl_pct_of_max:.1f}%; margin-left: {50.0 - pnl_pct_of_max:.1f}%;"
+            bar_color_class = "bar-neg"
+            
+        bar_chart_html += f"""
+        <div class="bar-chart-row">
+            <div class="bar-chart-label"><strong>{r['symbol']}</strong> <span class="bar-chart-pool">{r['pool']}</span></div>
+            <div class="bar-chart-track-wrap">
+                <div class="bar-chart-track">
+                    <div class="bar-chart-fill {bar_color_class}" style="{bar_style}"></div>
+                    <div class="bar-chart-grid-zero"></div>
+                </div>
+            </div>
+            <div class="bar-chart-value {pnl_class}">{pnl_val_str}</div>
+        </div>
+        """
+    bar_chart_html += """
+        </div>
+    </div>
+    """
+
+    win_rate_val = trade_stats['win_rate_pct']
+    win_dash = f"{win_rate_val:.2f}"
+    loss_dash = f"{100.0 - win_rate_val:.2f}"
 
     html = f"""<!DOCTYPE html>
 <html lang="en">
@@ -686,43 +856,122 @@ def generate_html(account_metrics, risk_metrics, trade_stats, positions_df, char
     <title>Trading Bot Dashboard</title>
     <style>
         *{{ box-sizing:border-box; }}
-        body{{ margin:0; background:#0b1220; color:#e2e8f0; font-family:Inter,Segoe UI,Arial,sans-serif; }}
+        body{{ margin:0; background:#060b13; color:#f8fafc; font-family:Inter,Segoe UI,Arial,sans-serif; -webkit-font-smoothing: antialiased; }}
         .container{{ max-width:1280px; margin:0 auto; padding:24px; }}
-        .header{{ margin-bottom:20px; }}
-        .title{{ margin:0; font-size:28px; }}
-        .subtitle{{ margin:6px 0 0; color:#94a3b8; font-size:14px; }}
-        .cards{{ display:grid; grid-template-columns:repeat(4,minmax(180px,1fr)); gap:12px; margin-bottom:16px; }}
-        .card{{ background:#111b2e; border:1px solid #1e2a44; border-radius:10px; padding:14px; }}
-        .label{{ color:#94a3b8; font-size:12px; text-transform:uppercase; letter-spacing:.06em; }}
-        .value{{ margin-top:6px; font-size:24px; font-weight:700; color:#f8fafc; }}
-        .green{{ color:#22c55e; }} .red{{ color:#ef4444; }} .yellow{{ color:#eab308; }}
+        .header{{ margin-bottom:24px; display:flex; justify-content:space-between; align-items:flex-end; border-bottom: 1px solid #1d2d44; padding-bottom: 16px; }}
+        .title{{ margin:0; font-size:26px; font-weight: 800; letter-spacing: -0.02em; color: #f8fafc; }}
+        .subtitle{{ margin:4px 0 0; color:#64748b; font-size:12px; font-weight: 500; text-transform: uppercase; letter-spacing: 0.05em; }}
+        
+        /* ── KPI Cards ── */
+        .cards{{ display:grid; grid-template-columns:repeat(4,minmax(180px,1fr)); gap:16px; margin-bottom:24px; }}
+        .card{{ background:#0e1622; border:1px solid #1d2d44; border-radius:8px; padding:18px 20px; display:flex; flex-direction:column; justify-content:space-between; transition:all 0.2s; }}
+        .card:hover {{ border-color: #3b82f6; transform: translateY(-2px); }}
+        .card-label{{ color:#64748b; font-size:11px; font-weight:600; text-transform:uppercase; letter-spacing:.07em; margin-bottom: 8px; }}
+        .card-value{{ font-size:32px; font-weight:800; color:#f8fafc; line-height:1.1; }}
+        
+        .green{{ color:#10b981 !important; }} 
+        .red{{ color:#f43f5e !important; }} 
+        .text-blue{{ color:#3b82f6 !important; }}
+        
+        /* ── Sections Grid ── */
+        .sections{{ display:grid; grid-template-columns:1fr 1.1fr 0.9fr; gap:16px; margin-bottom:24px; }}
+        .panel{{ background:#0e1622; border:1px solid #1d2d44; border-radius:8px; padding:18px; }}
+        .panel h3{{ margin:0 0 16px; font-size:15px; font-weight:700; text-transform:uppercase; letter-spacing:0.05em; color: #94a3b8; border-bottom: 1px solid #1d2d44; padding-bottom: 8px; }}
+        
+        /* ── Snapshot Panel ── */
+        .stats-grid{{ display:grid; grid-template-columns:repeat(2,minmax(100px,1fr)); gap:12px; }}
+        .stat-box{{ background:#090e17; border:1px solid #1d2d44; border-radius:6px; padding:12px 14px; }}
+        .stat-box.full-width {{ grid-column: span 2; }}
+        .stat-box .label {{ font-size: 10px; color: #64748b; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 4px; }}
+        .stat-box .value {{ font-size: 18px; font-weight: 700; color: #f8fafc; }}
+        
+        /* ── Trade Stats Donut ── */
+        .trade-stats-container {{ display: flex; align-items: center; gap: 20px; }}
+        .donut-chart-wrap {{ width: 120px; height: 120px; flex-shrink: 0; position: relative; }}
+        .donut-svg {{ transform: rotate(-90deg); width: 100%; height: 100%; }}
+        .donut-center-pct {{ fill: #f8fafc; font-size: 6px; font-weight: 800; text-anchor: middle; transform: rotate(90deg); transform-origin: center; }}
+        .donut-center-sub {{ fill: #64748b; font-size: 2px; font-weight: 600; text-anchor: middle; transform: rotate(90deg); transform-origin: center; text-transform: uppercase; letter-spacing: 0.05em; }}
+        .trade-stats-details {{ flex-grow: 1; display: flex; flex-direction: column; gap: 8px; }}
+        .stat-row {{ display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #162235; padding-bottom: 4px; }}
+        .stat-row:last-child {{ border-bottom: none; }}
+        .stat-row .stat-label {{ font-size: 12px; color: #94a3b8; }}
+        .stat-row .stat-val {{ font-size: 13px; font-weight: 700; }}
+        
+        /* ── P&L Attribution Breakdown ── */
+        .attribution-list {{ display: flex; flex-direction: column; gap: 10px; }}
+        .attrib-row {{ display: flex; flex-direction: column; gap: 4px; }}
+        .attrib-meta {{ display: flex; justify-content: space-between; font-size: 12px; }}
+        .attrib-sym {{ color: #e2e8f0; }}
+        .attrib-val {{ font-weight: 600; }}
+        .attrib-progress-container {{ display: flex; align-items: center; gap: 8px; }}
+        .attrib-progress-bar {{ height: 5px; background: #10b981; border-radius: 3px; }}
+        .attrib-pct {{ font-size: 11px; color: #64748b; font-weight: 600; flex-shrink: 0; width: 32px; text-align: right; }}
+        
+        /* ── Position Table Double-Sided P&L Progress Bar ── */
+        .pnl-progress-flex {{ display: flex; align-items: center; gap: 12px; width: 100%; }}
+        .pnl-pc-text {{ font-size: 13px; font-weight: 700; width: 55px; text-align: right; flex-shrink: 0; }}
+        .pnl-progress-track {{ height: 6px; background: #1a2436; border-radius: 3px; flex-grow: 1; position: relative; overflow: hidden; display: flex; align-items: center; border: 1px solid #1d2d44; }}
+        .pnl-progress-bar {{ height: 100%; border-radius: 2px; }}
+        .pnl-progress-bar.pos {{ background: #10b981; }}
+        .pnl-progress-bar.neg {{ background: #f43f5e; }}
+        .pnl-progress-center {{ position: absolute; left: 50%; top: 0; bottom: 0; width: 1px; background: #64748b; opacity: 0.8; }}
+        .side-badge {{ padding: 2px 6px; border-radius: 4px; font-size: 11px; font-weight: 700; background: rgba(59, 130, 246, 0.15); color: #3b82f6; border: 1px solid rgba(59, 130, 246, 0.3); }}
+        
+        /* ── Horizontal Bar Chart ── */
+        .bar-chart-panel {{ background:#0e1622; border:1px solid #1d2d44; border-radius:8px; padding:18px; }}
+        .bar-chart-container {{ display: flex; flex-direction: column; gap: 10px; margin-top: 12px; }}
+        .bar-chart-row {{ display: flex; align-items: center; gap: 16px; height: 26px; }}
+        .bar-chart-label {{ font-size: 12px; color: #f8fafc; width: 90px; flex-shrink: 0; text-align: left; display: flex; align-items: center; gap: 6px; }}
+        .bar-chart-pool {{ font-size: 8px; color: #64748b; background: #1e293b; padding: 1px 4px; border-radius: 3px; font-weight: normal; }}
+        .bar-chart-track-wrap {{ flex-grow: 1; height: 100%; display: flex; align-items: center; }}
+        .bar-chart-track {{ height: 14px; background: #0a0f18; border: 1px solid #1d2d44; border-radius: 3px; flex-grow: 1; position: relative; overflow: hidden; }}
+        .bar-chart-fill {{ height: 100%; border-radius: 2px; transition: width 0.3s ease; }}
+        .bar-chart-fill.bar-pos {{ background: linear-gradient(90deg, rgba(16, 185, 129, 0.6), rgba(16, 185, 129, 0.95)); }}
+        .bar-chart-fill.bar-neg {{ background: linear-gradient(90deg, rgba(244, 63, 94, 0.95), rgba(244, 63, 94, 0.6)); }}
+        .bar-chart-grid-zero {{ position: absolute; left: 50%; top: 0; bottom: 0; width: 1px; background: #64748b; z-index: 2; }}
+        .bar-chart-value {{ font-size: 12px; font-weight: 700; width: 85px; text-align: right; flex-shrink: 0; }}
+        
+        /* ── Calendar Performance Heatmap ── */
+        .heatmap-panel {{ background:#0e1622; border:1px solid #1d2d44; border-radius:8px; padding:18px; }}
+        .heatmap-wrapper {{ position: relative; margin-top: 24px; overflow-x: auto; }}
+        .heatmap-grid {{ display: inline-block; min-width: 100%; padding-top: 20px; }}
+        .heatmap-grid-inner {{ display: flex; gap: 6px; }}
+        .heatmap-cols-wrap {{ display: flex; gap: 3px; position: relative; }}
+        .heatmap-week-col {{ display: flex; flex-direction: column; gap: 3px; }}
+        .heatmap-cell {{ width: 11px; height: 11px; background: #090e17; border: 1px solid #162235; border-radius: 2px; cursor: pointer; position: relative; }}
+        .heatmap-cell:hover {{ border-color: #3b82f6 !important; transform: scale(1.15); z-index: 5; }}
+        .heatmap-cell.empty-cell {{ background: transparent; border: none; cursor: default; pointer-events: none; }}
+        .heatmap-day-labels {{ display: flex; flex-direction: column; gap: 3px; font-size: 9px; color: #64748b; justify-content: space-between; padding-right: 6px; height: 95px; width: 28px; text-align: left; text-transform: uppercase; font-weight: 600; }}
+        .heatmap-months-labels {{ position: absolute; top: -18px; left: 34px; right: 0; height: 16px; font-size: 10px; color: #64748b; text-transform: uppercase; font-weight: 600; letter-spacing: 0.05em; }}
+        .heatmap-legend {{ display: flex; justify-content: flex-end; align-items: center; gap: 8px; margin-top: 16px; font-size: 11px; color: #64748b; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; }}
+        .legend-scale {{ display: flex; gap: 2px; }}
+        .legend-cell {{ width: 10px; height: 10px; border-radius: 1px; }}
+        .heatmap-tooltip {{ position: absolute; background: #0a0f18; border: 1px solid #3b82f6; border-radius: 4px; padding: 8px 12px; color: #f8fafc; font-size: 12px; pointer-events: none; opacity: 0; transition: opacity 0.15s ease; z-index: 100; box-shadow: 0 4px 12px rgba(0,0,0,0.5); line-height: 1.4; }}
+        
         /* ── Chart ── */
-        .chart-panel{{ background:#111b2e; border:1px solid #1e2a44; border-radius:10px; padding:16px; margin-bottom:16px; }}
-        .chart-header{{ display:flex; justify-content:space-between; align-items:center; margin-bottom:12px; flex-wrap:wrap; gap:8px; }}
-        .chart-header h3{{ margin:0; font-size:16px; }}
-        .tf-buttons{{ display:flex; gap:4px; }}
-        .tf-btn{{ background:#1e293b; color:#94a3b8; border:1px solid #334155; border-radius:6px; padding:5px 12px; cursor:pointer; font-size:12px; font-weight:600; transition:all .15s; }}
-        .tf-btn:hover{{ background:#334155; color:#e2e8f0; }}
+        .chart-panel{{ background:#0e1622; border:1px solid #1d2d44; border-radius:8px; padding:18px; margin-bottom:24px; }}
+        .chart-header{{ display:flex; justify-content:space-between; align-items:center; margin-bottom:16px; flex-wrap:wrap; gap:8px; border-bottom: 1px solid #1d2d44; padding-bottom: 8px; }}
+        .chart-header h3{{ margin:0; font-size:15px; font-weight:700; text-transform:uppercase; letter-spacing:0.05em; color:#94a3b8; }}
+        .tf-buttons{{ display:flex; gap:6px; }}
+        .tf-btn{{ background:#090e17; color:#64748b; border:1px solid #1d2d44; border-radius:4px; padding:5px 12px; cursor:pointer; font-size:11px; font-weight:700; transition:all .15s; text-transform:uppercase; }}
+        .tf-btn:hover{{ background:#162235; color:#e2e8f0; border-color: #3b82f6; }}
         .tf-btn.active{{ background:#3b82f6; color:#fff; border-color:#3b82f6; }}
         .chart-info{{ margin-bottom:8px; }}
-        .chart-info .eq-value{{ font-size:22px; font-weight:700; }}
-        .chart-info .eq-change{{ font-size:14px; margin-left:8px; }}
-        .chart-info .eq-date{{ display:block; color:#94a3b8; font-size:12px; margin-top:2px; }}
+        .chart-info .eq-value{{ font-size:24px; font-weight:800; color:#f8fafc; }}
+        .chart-info .eq-change{{ font-size:14px; margin-left:8px; font-weight:700; }}
+        .chart-info .eq-date{{ display:block; color:#64748b; font-size:11px; margin-top:4px; text-transform: uppercase; font-weight: 500; letter-spacing: 0.05em; }}
         #equityCanvas{{ width:100%; height:260px; display:block; }}
-        /* ── Sections ── */
-        .sections{{ display:grid; grid-template-columns:1fr 1fr; gap:12px; margin-bottom:16px; }}
-        .panel{{ background:#111b2e; border:1px solid #1e2a44; border-radius:10px; padding:14px; }}
-        .panel h3{{ margin:0 0 12px; font-size:16px; }}
-        .stats-grid{{ display:grid; grid-template-columns:repeat(2,minmax(100px,1fr)); gap:10px; }}
-        .stat-box{{ background:#0f172a; border:1px solid #1e293b; border-radius:8px; padding:10px; }}
-        .note{{ color:#94a3b8; font-size:12px; font-style:italic; margin:8px 0 0; }}
-        /* ── Table ── */
-        .table-wrap{{ background:#111b2e; border:1px solid #1e2a44; border-radius:10px; overflow:hidden; }}
+        
+        /* ── Table & Layout ── */
+        .table-wrap{{ background:#0e1622; border:1px solid #1d2d44; border-radius:8px; overflow:hidden; margin-bottom:24px; }}
         table{{ width:100%; border-collapse:collapse; }}
-        thead{{ background:#0f172a; }}
-        th,td{{ padding:11px 10px; border-bottom:1px solid #1e2a44; font-size:13px; text-align:left; white-space:nowrap; }}
-        th{{ color:#cbd5e1; font-weight:600; }}
-        tbody tr:hover{{ background:#0f172a; }}
+        thead{{ background:#0a0f18; }}
+        th,td{{ padding:12px 14px; border-bottom:1px solid #1d2d44; font-size:13px; text-align:left; white-space:nowrap; }}
+        th{{ color:#cbd5e1; font-weight:600; text-transform:uppercase; letter-spacing:0.05em; font-size:12px; }}
+        tbody tr:hover{{ background:#162235; }}
+        
+        .note{{ color:#64748b; font-size:12px; font-style:italic; margin:8px 0 0; line-height: 1.4; }}
+        
         @media(max-width:1024px){{
             .cards{{ grid-template-columns:repeat(2,minmax(180px,1fr)); }}
             .sections{{ grid-template-columns:1fr; }}
@@ -732,22 +981,39 @@ def generate_html(account_metrics, risk_metrics, trade_stats, positions_df, char
 <body>
 <div class="container">
     <div class="header">
-        <h1 class="title">Trading Bot Performance Dashboard</h1>
-        <p class="subtitle">Last Updated: {now_utc}</p>
+        <div>
+            <h1 class="title">Trading Bot Performance Dashboard</h1>
+            <p class="subtitle">Live Performance Report</p>
+        </div>
+        <div style="text-align: right; color:#64748b; font-size:11px; font-weight:700; text-transform:uppercase; letter-spacing:0.05em;">
+            Last Updated: <span style="color:#f8fafc;">{now_utc}</span>
+        </div>
     </div>
 
     <!-- ── Top cards ── -->
     <div class="cards">
-        <div class="card"><div class="label">Balance (Equity)</div><div class="value">{fmt_money(account_metrics['equity'])}</div></div>
-        <div class="card"><div class="label">Sharpe Ratio</div><div class="value">{risk_metrics['sharpe']:.2f}</div></div>
-        <div class="card"><div class="label">Max Drawdown</div><div class="value {mdd_class}">{risk_metrics['max_drawdown_pct']:.2f}%</div></div>
-        <div class="card"><div class="label">Daily P/L</div><div class="value {daily_pl_class}">{fmt_money(account_metrics['daily_pl'])}</div></div>
+        <div class="card">
+            <div class="card-label">Balance (Equity)</div>
+            <div class="card-value">{fmt_money(account_metrics['equity'])}</div>
+        </div>
+        <div class="card">
+            <div class="card-label">Sharpe Ratio</div>
+            <div class="card-value text-blue">{risk_metrics['sharpe']:.2f}</div>
+        </div>
+        <div class="card">
+            <div class="card-label">Max Drawdown</div>
+            <div class="card-value {mdd_class}">{risk_metrics['max_drawdown_pct']:.2f}%</div>
+        </div>
+        <div class="card">
+            <div class="card-label">Daily P/L</div>
+            <div class="card-value {daily_pl_class}">{fmt_money(account_metrics['daily_pl'])}</div>
+        </div>
     </div>
 
     <!-- ── Equity chart ── -->
     <div class="chart-panel">
         <div class="chart-header">
-            <h3>Portfolio Equity</h3>
+            <h3>Portfolio Equity Trend</h3>
             <div class="tf-buttons">
                 <button class="tf-btn active" data-tf="1D">1D</button>
                 <button class="tf-btn" data-tf="1W">1W</button>
@@ -764,8 +1030,9 @@ def generate_html(account_metrics, risk_metrics, trade_stats, positions_df, char
         <canvas id="equityCanvas"></canvas>
     </div>
 
-    <!-- ── Account snapshot + Trade stats ── -->
+    <!-- ── Three Column Visual Section ── -->
     <div class="sections">
+        <!-- Col 1: Account Snapshot -->
         <div class="panel">
             <h3>Account Snapshot</h3>
             <div class="stats-grid">
@@ -773,37 +1040,67 @@ def generate_html(account_metrics, risk_metrics, trade_stats, positions_df, char
                 <div class="stat-box"><div class="label">Last Close Equity</div><div class="value">{fmt_money(account_metrics['last_close_equity'])}</div></div>
                 <div class="stat-box"><div class="label">Peak Equity (24H)</div><div class="value">{fmt_money(account_metrics['peak_equity_24h'])}</div></div>
                 <div class="stat-box"><div class="label">All-Time Peak Equity</div><div class="value green">{fmt_money(account_metrics['all_time_peak'])}</div></div>
-                <div class="stat-box"><div class="label">Ongoing Trades</div><div class="value">{account_metrics['ongoing_trades']}</div></div>
+                <div class="stat-box full-width"><div class="label">Active Ongoing Trades</div><div class="value text-blue">{account_metrics['ongoing_trades']}</div></div>
             </div>
         </div>
+        
+        <!-- Col 2: Trade Statistics with Donut Chart -->
         <div class="panel">
             <h3>Trade Statistics</h3>
-            <div class="stats-grid">
-                <div class="stat-box"><div class="label">Winning Trades</div><div class="value green">{trade_stats['win_trades']}</div></div>
-                <div class="stat-box"><div class="label">Losing Trades</div><div class="value red">{trade_stats['loss_trades']}</div></div>
-                <div class="stat-box"><div class="label">Win Rate</div><div class="value">{trade_stats['win_rate_pct']:.2f}%</div></div>
-                <div class="stat-box"><div class="label">Closed Trades</div><div class="value">{total_closed}</div></div>
+            <div class="trade-stats-container">
+                <div class="donut-chart-wrap">
+                    <svg class="donut-svg" viewBox="0 0 36 36">
+                        <circle cx="18" cy="18" r="15.915" fill="none" stroke="#f43f5e" stroke-width="3"></circle>
+                        <circle cx="18" cy="18" r="15.915" fill="none" stroke="#10b981" stroke-width="3"
+                                stroke-dasharray="{win_dash} {loss_dash}" stroke-dashoffset="25"></circle>
+                        <text x="18" y="16.5" class="donut-center-pct">{trade_stats['win_rate_pct']:.1f}%</text>
+                        <text x="18" y="22.5" class="donut-center-sub">Win Rate</text>
+                    </svg>
+                </div>
+                <div class="trade-stats-details">
+                    <div class="stat-row">
+                        <span class="stat-label">Winning Trades</span>
+                        <span class="stat-val green">{trade_stats['win_trades']}</span>
+                    </div>
+                    <div class="stat-row">
+                        <span class="stat-label">Losing Trades</span>
+                        <span class="stat-val red">{trade_stats['loss_trades']}</span>
+                    </div>
+                    <div class="stat-row">
+                        <span class="stat-label">Total Closed</span>
+                        <span class="stat-val">{total_closed}</span>
+                    </div>
+                </div>
             </div>
             {trade_note}
+        </div>
+
+        <!-- Col 3: P&L Attribution Breakdown -->
+        <div class="panel">
+            <h3>P&amp;L Attribution (Gains)</h3>
+            {attribution_html}
         </div>
     </div>
 
     <!-- ── Positions table ── -->
     <div class="table-wrap">
-        <table>
+        <table style="width: 100%;">
             <thead><tr>
                 <th>Symbol</th><th>Side</th><th>Qty</th>
-                <th>Size (Market Value)</th><th>Average Buy Price</th><th>Current Price</th>
-                <th>Unrealized P&amp;L ($)</th><th>P&amp;L (%)</th><th>Today&#39;s Change (%)</th>
+                <th>Market Value</th><th>Avg Price</th><th>Current Price</th>
+                <th>Unrealized P&amp;L ($)</th><th>Unrealized P&amp;L (%)</th><th>Today&#39;s Change</th>
             </tr></thead>
             <tbody>{position_rows}</tbody>
         </table>
     </div>
 
-    <!-- ── Trade History ── -->
+    <!-- ── Visual Bar Chart ── -->
+    {bar_chart_html}
+
+    <!-- ── Trade History Accordions ── -->
     {trade_history_html}
 
-    <!-- ── Daily Equity History Table ── -->
+    <!-- ── Daily Performance Heatmap ── -->
     {equity_table_html}
 </div>
 
@@ -838,7 +1135,7 @@ def generate_html(account_metrics, risk_metrics, trade_stats, positions_df, char
         var dtEl=document.getElementById('chartEqDate');
         if(!data.length){{
             ctx.clearRect(0,0,W,H);
-            ctx.fillStyle='#94a3b8'; ctx.font='14px sans-serif';
+            ctx.fillStyle='#64748b'; ctx.font='14px sans-serif';
             ctx.fillText('No data for this timeframe',W/2-80,H/2);
             eqEl.textContent=''; chEl.textContent=''; dtEl.textContent='';
             return;
@@ -854,7 +1151,6 @@ def generate_html(account_metrics, risk_metrics, trade_stats, positions_df, char
         var vals=data.map(function(p){{ return p[1]; }});
         var minV=Math.min.apply(null,vals), maxV=Math.max.apply(null,vals);
         var pad=10, range=maxV-minV||1;
-        // y-axis label width
         var yLabelW=60;
         var chartW=W-yLabelW-pad, chartH=H-pad*2;
 
@@ -864,7 +1160,7 @@ def generate_html(account_metrics, risk_metrics, trade_stats, positions_df, char
         ctx.clearRect(0,0,W,H);
 
         // grid lines + y labels
-        ctx.strokeStyle='#1e2a44'; ctx.lineWidth=0.5;
+        ctx.strokeStyle='#1d2d44'; ctx.lineWidth=0.5;
         ctx.fillStyle='#64748b'; ctx.font='11px sans-serif'; ctx.textAlign='right';
         var gridN=4;
         for(var g=0;g<=gridN;g++){{
@@ -877,11 +1173,11 @@ def generate_html(account_metrics, risk_metrics, trade_stats, positions_df, char
         // gradient fill
         var grad=ctx.createLinearGradient(0,pad,0,pad+chartH);
         if(positive){{
-            grad.addColorStop(0,'rgba(34,197,94,0.25)');
-            grad.addColorStop(1,'rgba(34,197,94,0.0)');
+            grad.addColorStop(0,'rgba(16, 185, 129, 0.18)');
+            grad.addColorStop(1,'rgba(16, 185, 129, 0.0)');
         }} else {{
-            grad.addColorStop(0,'rgba(239,68,68,0.25)');
-            grad.addColorStop(1,'rgba(239,68,68,0.0)');
+            grad.addColorStop(0,'rgba(244, 63, 94, 0.18)');
+            grad.addColorStop(1,'rgba(244, 63, 94, 0.0)');
         }}
         ctx.beginPath();
         ctx.moveTo(xPos(0),yPos(data[0][1]));
@@ -894,7 +1190,7 @@ def generate_html(account_metrics, risk_metrics, trade_stats, positions_df, char
         ctx.beginPath();
         ctx.moveTo(xPos(0),yPos(data[0][1]));
         for(var i=1;i<data.length;i++) ctx.lineTo(xPos(i),yPos(data[i][1]));
-        ctx.strokeStyle=positive?'#22c55e':'#ef4444'; ctx.lineWidth=2; ctx.stroke();
+        ctx.strokeStyle=positive?'#10b981':'#f43f5e'; ctx.lineWidth=2; ctx.stroke();
     }}
 
     btns.forEach(function(b){{
@@ -908,6 +1204,124 @@ def generate_html(account_metrics, risk_metrics, trade_stats, positions_df, char
 
     window.addEventListener('resize',function(){{ draw(curTF); }});
     draw(curTF);
+}})();
+
+// ── Heatmap JS (vanilla, zero dependencies) ──
+(function(){{
+    var data = {heatmap_data_json};
+    var container = document.getElementById('heatmapGrid');
+    if(!container || !data.length) return;
+
+    var dataMap = {{}};
+    var maxVal = 0.1;
+    data.forEach(function(d){{
+        dataMap[d.date] = d;
+        if(Math.abs(d.change_pct) > maxVal) {{
+            maxVal = Math.abs(d.change_pct);
+        }}
+    }});
+
+    var dates = data.map(function(d){{ return new Date(d.date + 'T00:00:00'); }});
+    var minDate = new Date(Math.min.apply(null, dates));
+    var maxDate = new Date(Math.max.apply(null, dates));
+
+    // Sunday align
+    var startDate = new Date(minDate);
+    startDate.setDate(startDate.getDate() - startDate.getDay());
+
+    // Saturday align
+    var endDate = new Date(maxDate);
+    endDate.setDate(endDate.getDate() + (6 - endDate.getDay()));
+
+    var tempDate = new Date(startDate);
+    var weeksCount = Math.ceil((endDate - startDate) / (7 * 24 * 60 * 60 * 1000));
+    
+    var colsHtml = '';
+    var currentMonth = -1;
+    var monthsLabelHtml = '<div class="heatmap-months-labels">';
+    var weekColWidth = 14; 
+    
+    for (var w = 0; w < weeksCount; w++) {{
+        var colHtml = '<div class="heatmap-week-col">';
+        
+        for (var d = 0; d < 7; d++) {{
+            var dateStr = tempDate.toISOString().split('T')[0];
+            var dayData = dataMap[dateStr];
+            
+            var cellStyle = '';
+            var cellClass = 'heatmap-cell';
+            var tooltipText = tempDate.toLocaleDateString([], {{month:'short', day:'numeric', year:'numeric'}}) + ' (No Trading)';
+            
+            if (dayData) {{
+                var changePct = dayData.change_pct;
+                var positive = changePct >= 0;
+                var intensity = maxVal > 0 ? Math.min(1.0, Math.max(0.18, Math.abs(changePct) / maxVal)) : 0.5;
+                
+                if (changePct === 0) {{
+                    cellStyle = 'background: #1e293b;';
+                }} else if (positive) {{
+                    cellStyle = 'background: rgba(16, 185, 129, ' + intensity.toFixed(2) + '); border: 1px solid rgba(16, 185, 129, ' + (intensity * 0.4).toFixed(2) + ');';
+                }} else {{
+                    cellStyle = 'background: rgba(244, 63, 94, ' + intensity.toFixed(2) + '); border: 1px solid rgba(244, 63, 94, ' + (intensity * 0.4).toFixed(2) + ');';
+                }}
+                
+                tooltipText = '<strong>' + tempDate.toLocaleDateString([], {{month:'short', day:'numeric', year:'numeric'}}) + '</strong><br/>' +
+                              'Equity: <strong>$' + dayData.equity.toLocaleString(undefined, {{minimumFractionDigits:2, maximumFractionDigits:2}}) + '</strong><br/>' +
+                              'Change: <strong class="' + (positive ? 'green' : 'red') + '">' + 
+                              (positive ? '+' : '') + dayData.change.toLocaleString(undefined, {{minimumFractionDigits:2, maximumFractionDigits:2}}) + 
+                              ' (' + (positive ? '+' : '') + changePct.toFixed(2) + '%)</strong>';
+                
+                cellClass += ' active-cell';
+            }} else {{
+                cellClass += ' empty-cell';
+            }}
+            
+            colHtml += '<div class="' + cellClass + '" style="' + cellStyle + '" data-tooltip="' + encodeURIComponent(tooltipText) + '"></div>';
+            
+            if (tempDate.getDay() === 0 && tempDate.getDate() <= 7) {{
+                var m = tempDate.getMonth();
+                if (m !== currentMonth) {{
+                    currentMonth = m;
+                    var monthName = tempDate.toLocaleDateString([], {{month:'short'}});
+                    monthsLabelHtml += '<span style="position: absolute; left: ' + ((w * weekColWidth) + 34) + 'px;">' + monthName + '</span>';
+                }}
+            }}
+            
+            tempDate.setDate(tempDate.getDate() + 1);
+        }}
+        
+        colHtml += '</div>';
+        colsHtml += colHtml;
+    }}
+    
+    monthsLabelHtml += '</div>';
+    
+    var dayLabelsHtml = '<div class="heatmap-day-labels">' +
+                        '<span>Sun</span><span></span><span>Tue</span><span></span><span>Thu</span><span></span><span>Sat</span>' +
+                        '</div>';
+                        
+    container.innerHTML = monthsLabelHtml + '<div class="heatmap-grid-inner">' + dayLabelsHtml + '<div class="heatmap-cols-wrap">' + colsHtml + '</div>' + '</div>';
+
+    // Tooltips
+    var tooltip = document.createElement('div');
+    tooltip.className = 'heatmap-tooltip';
+    document.body.appendChild(tooltip);
+    
+    var activeCells = container.querySelectorAll('.active-cell');
+    activeCells.forEach(function(cell){{
+        cell.addEventListener('mouseover', function(e){{
+            var text = decodeURIComponent(cell.getAttribute('data-tooltip'));
+            tooltip.innerHTML = text;
+            tooltip.style.opacity = 1;
+        }});
+        cell.addEventListener('mousemove', function(e){{
+            tooltip.style.left = (e.pageX + 12) + 'px';
+            tooltip.style.top = (e.pageY - 20) + 'px';
+        }});
+        cell.addEventListener('mouseout', function(e){{
+            tooltip.style.opacity = 0;
+        }});
+    }});
 }})();
 </script>
 </body>
@@ -927,7 +1341,6 @@ def main():
     last_close_equity = _safe_float(getattr(account, "last_equity", 0.0), default=equity)
     daily_pl = equity - last_close_equity
 
-    # ── Fetch all chart timeframes (single pass) ─────────────────────
     chart_series = {}
     raw_histories = {}
     all_time_peak = equity  # fallback
@@ -949,7 +1362,6 @@ def main():
             chart_series[cfg["key"]] = []
             raw_histories[cfg["key"]] = pd.DataFrame()
 
-    # Reuse already-fetched data for risk metrics
     history_all_df = raw_histories.get("All", pd.DataFrame())
     history_24h_df = raw_histories.get("1D", pd.DataFrame())
 
@@ -965,7 +1377,6 @@ def main():
     ongoing_trades = len(positions)
 
     # ── Trade statistics ───────────────────────────────────────────────
-    # Fetch ALL closed orders using pagination (Alpaca limits to 500 per request)
     closed_orders = []
     until_time = None
     
@@ -988,7 +1399,6 @@ def main():
         dt = getattr(last_order, "submitted_at", None)
         if not dt:
             break
-        # Slight negative offset to avoid fetching the exact same order again
         until_time = dt
 
     filled_orders = [
@@ -999,9 +1409,33 @@ def main():
     ]
     trade_stats = calculate_trade_statistics(filled_orders)
 
-    # ── Per-Stock Trade History & Roundtrips ───────────────────────────
+    # ── Master rows & trade history calculation ───────────────────────
     roundtrips = build_roundtrips_from_orders(filled_orders, positions)
-    trade_history_html = generate_trade_history_html(roundtrips)
+    
+    master_rows = []
+    for symbol, rts in roundtrips.items():
+        pool = rts[0].get('pool', '—') if rts else '—'
+        closed = [r for r in rts if r['pnl'] is not None]
+        wins = [r for r in closed if r['pnl'] >= 0]
+        losses = [r for r in closed if r['pnl'] < 0]
+        stops = [r for r in closed if 'Stop' in r['exit_reason']]
+        n_open = sum(1 for r in rts if r['pnl'] is None)
+        total_pnl = sum(r['pnl'] for r in closed) if closed else 0.0
+        win_rate = (len(wins) / len(closed) * 100.0) if closed else 0.0
+        master_rows.append({
+            'symbol': symbol,
+            'pool': pool,
+            'total': len(rts),
+            'closed': len(closed),
+            'wins': len(wins),
+            'losses': len(losses),
+            'stops': len(stops),
+            'open': n_open,
+            'win_rate': win_rate,
+            'total_pnl': total_pnl,
+        })
+
+    trade_history_html = generate_trade_history_html(roundtrips, master_rows)
 
     account_metrics = {
         "equity": equity,
@@ -1014,9 +1448,27 @@ def main():
     }
 
     chart_data_json = json.dumps(chart_series)
-    # ── Daily Equity Table ──────────────────────────────────────────────
-    all_daily_history = raw_histories.get("All", pd.DataFrame())
-    equity_table_html = generate_equity_table_html(all_daily_history)
+    
+    # ── Heatmap & Daily equity calculations ─────────────────────────────
+    heatmap_data = []
+    if not history_all_df.empty:
+        df = history_all_df.copy()
+        df = df.sort_values('timestamp').reset_index(drop=True)
+        df['equity'] = df['equity'].astype(float)
+        df['daily_change'] = df['equity'].diff()
+        df['daily_change_pct'] = df['equity'].pct_change() * 100
+        for _, row in df.iterrows():
+            chg = 0.0 if pd.isna(row['daily_change']) else float(row['daily_change'])
+            chg_pct = 0.0 if pd.isna(row['daily_change_pct']) else float(row['daily_change_pct'])
+            heatmap_data.append({
+                "date": row['timestamp'].strftime('%Y-%m-%d'),
+                "equity": float(row['equity']),
+                "change": chg,
+                "change_pct": chg_pct
+            })
+    heatmap_data_json = json.dumps(heatmap_data)
+
+    equity_table_html = generate_equity_table_html(history_all_df)
 
     html = generate_html(
         account_metrics, 
@@ -1025,7 +1477,9 @@ def main():
         positions_df, 
         chart_data_json,
         trade_history_html,
-        equity_table_html
+        equity_table_html,
+        heatmap_data_json,
+        master_rows
     )
 
     output_path = os.path.join(REPORT_DIR, "index.html")
