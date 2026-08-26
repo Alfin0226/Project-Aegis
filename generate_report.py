@@ -8,6 +8,7 @@ import requests
 from dotenv import load_dotenv
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import GetOrdersRequest, QueryOrderStatus
+import yfinance as yf
 
 
 load_dotenv()
@@ -111,19 +112,127 @@ def history_to_js_array(df):
     return records
 
 
-def calculate_risk_metrics(daily_history_df):
+def get_comparison_data(portfolio_df, period_key):
+    """
+    Fetch QQQ and SPY close prices, align with portfolio_df, and scale them to start at portfolio's initial value.
+    Returns: (qqq_js_list, spy_js_list)
+    """
+    if portfolio_df.empty:
+        return [], []
+        
+    yf_mapping = {
+        "1D": {"period": "1d", "interval": "5m"},
+        "1W": {"period": "5d", "interval": "15m"},
+        "1M": {"period": "1mo", "interval": "1d"},
+        "1Y": {"period": "1y", "interval": "1d"},
+        "All": {"period": "max", "interval": "1d"},
+    }
+    
+    cfg = yf_mapping.get(period_key, {"period": "max", "interval": "1d"})
+    
+    try:
+        yf_df = yf.download(["QQQ", "SPY"], period=cfg["period"], interval=cfg["interval"], progress=False)
+        if yf_df.empty or "Close" not in yf_df.columns:
+            return [], []
+            
+        close_df = yf_df["Close"].copy()
+        close_df = close_df.reset_index()
+        
+        time_col = "Date" if "Date" in close_df.columns else "Datetime"
+        if time_col not in close_df.columns and len(close_df.columns) > 0:
+            time_col = close_df.columns[0]
+            
+        close_df = close_df.rename(columns={time_col: "timestamp"})
+        
+        if close_df["timestamp"].dt.tz is None:
+            close_df["timestamp"] = close_df["timestamp"].dt.tz_localize("UTC")
+        else:
+            close_df["timestamp"] = close_df["timestamp"].dt.tz_convert("UTC")
+            
+        close_df = close_df.sort_values("timestamp").reset_index(drop=True)
+        
+        merged = pd.merge_asof(portfolio_df, close_df, on="timestamp", direction="nearest")
+        
+        if "QQQ" in merged.columns:
+            merged["QQQ"] = merged["QQQ"].ffill().bfill()
+        if "SPY" in merged.columns:
+            merged["SPY"] = merged["SPY"].ffill().bfill()
+            
+        if "QQQ" not in merged.columns or "SPY" not in merged.columns:
+            return [], []
+            
+        P_0 = float(merged["equity"].iloc[0])
+        Q_0 = float(merged["QQQ"].iloc[0])
+        S_0 = float(merged["SPY"].iloc[0])
+        
+        qqq_records = []
+        spy_records = []
+        
+        # If first benchmark price is zero/missing, return empty for that benchmark
+        # instead of substituting portfolio equity (which would be misleading)
+        has_qqq = bool(Q_0)
+        has_spy = bool(S_0)
+        
+        if not has_qqq and not has_spy:
+            return [], []
+        
+        if has_qqq:
+            qqq_series = (merged["QQQ"] / Q_0) * P_0
+        if has_spy:
+            spy_series = (merged["SPY"] / S_0) * P_0
+        
+        for idx, row in merged.iterrows():
+            ts_ms = int(row["timestamp"].timestamp() * 1000)
+            if has_qqq:
+                qqq_records.append([ts_ms, round(float(qqq_series.iloc[idx]), 2)])
+            if has_spy:
+                spy_records.append([ts_ms, round(float(spy_series.iloc[idx]), 2)])
+            
+        return qqq_records, spy_records
+
+    except Exception as e:
+        print(f"Warning: Failed to fetch/align comparison data for {period_key}: {e}")
+        return [], []
+
+
+def get_risk_free_rate():
+    """
+    Fetch the current annualized risk-free rate using the 13-week T-bill yield
+    (^IRX, quoted by Yahoo Finance as an annualized percentage, e.g. 5.10 -> 5.10%).
+    Returns the DAILY risk-free rate as a decimal (e.g. 0.0002), using a 252
+    trading-day convention. Falls back to 0.0 on any failure so report
+    generation never breaks because of this.
+    """
+    try:
+        irx = yf.Ticker("^IRX").history(period="5d")
+        if irx.empty or "Close" not in irx.columns:
+            return 0.0
+        annual_rate_pct = float(irx["Close"].dropna().iloc[-1])
+        annual_rate = annual_rate_pct / 100.0
+        daily_rate = annual_rate / 252.0
+        return daily_rate
+    except Exception as exc:
+        print(f"Warning: could not fetch risk-free rate, defaulting to 0.0: {exc}")
+        return 0.0
+
+
+def calculate_risk_metrics(daily_history_df, daily_risk_free_rate=0.0):
+    MIN_SHARPE_OBSERVATIONS = 20  # Need at least 20 daily returns to annualize meaningfully
+
     if daily_history_df.empty:
-        return {"sharpe": 0.0, "max_drawdown_pct": 0.0}
+        return {"sharpe": None, "max_drawdown_pct": 0.0}
 
     equity = daily_history_df["equity"].astype(float)
     if len(equity) < 2:
-        return {"sharpe": 0.0, "max_drawdown_pct": 0.0}
+        return {"sharpe": None, "max_drawdown_pct": 0.0}
 
     daily_returns = equity.pct_change().dropna()
-    if daily_returns.empty or daily_returns.std() == 0:
-        sharpe_ratio = 0.0
+    excess_returns = daily_returns - daily_risk_free_rate
+
+    if len(daily_returns) < MIN_SHARPE_OBSERVATIONS or excess_returns.empty or excess_returns.std() == 0:
+        sharpe_ratio = None
     else:
-        sharpe_ratio = float((daily_returns.mean() / daily_returns.std()) * np.sqrt(252))
+        sharpe_ratio = float((excess_returns.mean() / excess_returns.std()) * np.sqrt(252))
 
     rolling_peak = equity.cummax()
     drawdowns = (equity - rolling_peak) / rolling_peak
@@ -131,95 +240,7 @@ def calculate_risk_metrics(daily_history_df):
     return {"sharpe": sharpe_ratio, "max_drawdown_pct": max_drawdown_pct}
 
 
-def calculate_trade_statistics(filled_orders):
-    if not filled_orders:
-        return {
-            "win_trades": 0,
-            "loss_trades": 0,
-            "win_rate_pct": 0.0,
-        }
 
-    sorted_orders = sorted(
-        filled_orders,
-        key=lambda order: getattr(order, "filled_at", None) or getattr(order, "submitted_at", None),
-    )
-
-    inventory = {}
-    win_trades = 0
-    loss_trades = 0
-
-    for order in sorted_orders:
-        symbol = getattr(order, "symbol", "")
-        side = _clean_side(getattr(order, "side", "")) # Use _clean_side here
-        qty = _safe_float(getattr(order, "filled_qty", 0.0))
-        price = _safe_float(getattr(order, "filled_avg_price", 0.0))
-
-        if not symbol or qty <= 0 or price <= 0:
-            continue
-
-        if symbol not in inventory:
-            inventory[symbol] = {"position_qty": 0.0, "avg_price": 0.0}
-
-        state = inventory[symbol]
-        position_qty = state["position_qty"]
-        avg_price = state["avg_price"]
-
-        if side == "BUY": # Compare against "BUY"
-            if position_qty < 0:
-                cover_qty = min(qty, abs(position_qty))
-                realized_pnl = (avg_price - price) * cover_qty
-                if realized_pnl > 0:
-                    win_trades += 1
-                elif realized_pnl < 0:
-                    loss_trades += 1
-                position_qty += cover_qty
-                qty -= cover_qty
-                if abs(position_qty) < 1e-9:
-                    position_qty = 0.0
-                    avg_price = 0.0
-
-            if qty > 0:
-                if position_qty > 0:
-                    total_cost = (position_qty * avg_price) + (qty * price)
-                    position_qty += qty
-                    avg_price = total_cost / position_qty
-                else:
-                    position_qty = qty
-                    avg_price = price
-
-        elif side == "SELL": # Compare against "SELL"
-            if position_qty > 0:
-                close_qty = min(qty, position_qty)
-                realized_pnl = (price - avg_price) * close_qty
-                if realized_pnl > 0:
-                    win_trades += 1
-                elif realized_pnl < 0:
-                    loss_trades += 1
-                position_qty -= close_qty
-                qty -= close_qty
-                if abs(position_qty) < 1e-9:
-                    position_qty = 0.0
-                    avg_price = 0.0
-
-            if qty > 0:
-                if position_qty < 0:
-                    total_proceeds_basis = (abs(position_qty) * avg_price) + (qty * price)
-                    position_qty -= qty
-                    avg_price = total_proceeds_basis / abs(position_qty)
-                else:
-                    position_qty = -qty
-                    avg_price = price
-
-        state["position_qty"] = position_qty
-        state["avg_price"] = avg_price
-
-    closed_trades = win_trades + loss_trades
-    win_rate_pct = (win_trades / closed_trades * 100.0) if closed_trades > 0 else 0.0
-    return {
-        "win_trades": win_trades,
-        "loss_trades": loss_trades,
-        "win_rate_pct": win_rate_pct,
-    }
 
 def build_roundtrips_from_orders(filled_orders, positions):
     """
@@ -245,7 +266,8 @@ def build_roundtrips_from_orders(filled_orders, positions):
 
     roundtrips = {}
     for symbol, trades in trades_by_symbol.items():
-        open_buys = []
+        open_buys = []   # Long entries awaiting a closing SELL
+        open_sells = []  # Short entries awaiting a covering BUY
         rts = []
 
         for t in trades: # Iterate through `trades` for the current symbol
@@ -255,63 +277,137 @@ def build_roundtrips_from_orders(filled_orders, positions):
             dt = getattr(t, "filled_at", None) or getattr(t, "submitted_at", None)
 
             if side == "BUY": # Compare against "BUY"
-                # We simply track the qty left in this buy order
-                open_buys.append({"qty": qty, "price": price, "date": dt})
-            elif side == "SELL" and open_buys: # Compare against "SELL"
-                sell_qty_remaining = qty
-                
-                while sell_qty_remaining > 1e-9 and open_buys:
-                    buy = open_buys[0]
-                    matched_qty = min(sell_qty_remaining, buy["qty"])
-                    
-                    entry_val = matched_qty * buy["price"]
-                    exit_val = matched_qty * price
-                    pnl = exit_val - entry_val
-                    pnl_pct = (price / buy["price"] - 1) * 100 if buy["price"] > 0 else 0
-                    
-                    # Try to infer reason based on Alpaca order type/client tag if possible
-                    # Or just label it purely based on trailing stop vs. limit/market
-                    order_type = str(getattr(t, "order_type", getattr(t, "type", ""))).lower()
-                    if "trailing_stop" in order_type:
-                        reason = "Trailing Stop"
-                    else:
-                        reason = "Exit Signal"
+                # First, try to match against open short lots (buy-to-cover)
+                if open_sells:
+                    buy_qty_remaining = qty
+                    while buy_qty_remaining > 1e-9 and open_sells:
+                        sell_lot = open_sells[0]
+                        matched_qty = min(buy_qty_remaining, sell_lot["qty"])
 
-                    rts.append({
-                        'entry_date': buy["date"],
-                        'exit_date': dt,
-                        'entry_price': buy["price"],
-                        'exit_price': price,
-                        'qty': matched_qty,
-                        'pnl': pnl,
-                        'pnl_pct': pnl_pct,
-                        'exit_reason': reason,
-                        'pool': "GUARDIAN" if symbol in GUARDIAN_ASSETS else "HUNTER"
-                    })
-                    
-                    buy["qty"] -= matched_qty
-                    sell_qty_remaining -= matched_qty
-                    
-                    if buy["qty"] <= 1e-9:
-                        open_buys.pop(0)
+                        # Short P&L: entry (sell) price - exit (buy) price
+                        entry_val = matched_qty * sell_lot["price"]
+                        exit_val = matched_qty * price
+                        pnl = entry_val - exit_val
+                        pnl_pct = (sell_lot["price"] / price - 1) * 100 if price > 0 else 0
 
-        # Still-open positions
+                        order_type = str(getattr(t, "order_type", getattr(t, "type", ""))).lower()
+                        if "trailing_stop" in order_type:
+                            reason = "Trailing Stop"
+                        else:
+                            reason = "Exit Signal"
+
+                        rts.append({
+                            'entry_date': sell_lot["date"],
+                            'exit_date': dt,
+                            'entry_price': sell_lot["price"],
+                            'exit_price': price,
+                            'qty': matched_qty,
+                            'pnl': pnl,
+                            'pnl_pct': pnl_pct,
+                            'exit_reason': reason,
+                            'side': 'SHORT',
+                            'pool': "GUARDIAN" if symbol in GUARDIAN_ASSETS else "HUNTER"
+                        })
+
+                        sell_lot["qty"] -= matched_qty
+                        buy_qty_remaining -= matched_qty
+
+                        if sell_lot["qty"] <= 1e-9:
+                            open_sells.pop(0)
+
+                    qty = buy_qty_remaining
+
+                # Remaining qty opens a new long position
+                if qty > 1e-9:
+                    open_buys.append({"qty": qty, "price": price, "date": dt})
+
+            elif side == "SELL": # Compare against "SELL"
+                # First, try to match against open long lots (sell-to-close)
+                if open_buys:
+                    sell_qty_remaining = qty
+                    
+                    while sell_qty_remaining > 1e-9 and open_buys:
+                        buy = open_buys[0]
+                        matched_qty = min(sell_qty_remaining, buy["qty"])
+                        
+                        entry_val = matched_qty * buy["price"]
+                        exit_val = matched_qty * price
+                        pnl = exit_val - entry_val
+                        pnl_pct = (price / buy["price"] - 1) * 100 if buy["price"] > 0 else 0
+                        
+                        # Try to infer reason based on Alpaca order type/client tag if possible
+                        # Or just label it purely based on trailing stop vs. limit/market
+                        order_type = str(getattr(t, "order_type", getattr(t, "type", ""))).lower()
+                        if "trailing_stop" in order_type:
+                            reason = "Trailing Stop"
+                        else:
+                            reason = "Exit Signal"
+
+                        rts.append({
+                            'entry_date': buy["date"],
+                            'exit_date': dt,
+                            'entry_price': buy["price"],
+                            'exit_price': price,
+                            'qty': matched_qty,
+                            'pnl': pnl,
+                            'pnl_pct': pnl_pct,
+                            'exit_reason': reason,
+                            'side': 'LONG',
+                            'pool': "GUARDIAN" if symbol in GUARDIAN_ASSETS else "HUNTER"
+                        })
+                        
+                        buy["qty"] -= matched_qty
+                        sell_qty_remaining -= matched_qty
+                        
+                        if buy["qty"] <= 1e-9:
+                            open_buys.pop(0)
+
+                    qty = sell_qty_remaining
+
+                # Remaining qty opens a new short position
+                if qty > 1e-9:
+                    open_sells.append({"qty": qty, "price": price, "date": dt})
+
+        # Still-open positions — compute unrealized P&L
         current_price = 0.0
         if symbol in pos_map:
             current_price = _safe_float(getattr(pos_map[symbol], "current_price", 0.0))
 
+        # Open long lots
         for buy in open_buys:
             if buy["qty"] > 1e-9:
+                unrealized_pnl = (current_price - buy["price"]) * buy["qty"] if current_price else None
+                unrealized_pnl_pct = (current_price / buy["price"] - 1) * 100 if current_price and buy["price"] else None
                 rts.append({
                     'entry_date': buy["date"],
                     'exit_date': None,
                     'entry_price': buy["price"],
                     'exit_price': None,
                     'qty': buy["qty"],
-                    'pnl': None,
-                    'pnl_pct': None,
+                    'pnl': unrealized_pnl,
+                    'pnl_pct': unrealized_pnl_pct,
                     'current_price': current_price,
                     'exit_reason': 'OPEN',
+                    'side': 'LONG',
+                    'pool': "GUARDIAN" if symbol in GUARDIAN_ASSETS else "HUNTER"
+                })
+
+        # Open short lots
+        for sell_lot in open_sells:
+            if sell_lot["qty"] > 1e-9:
+                unrealized_pnl = (sell_lot["price"] - current_price) * sell_lot["qty"] if current_price else None
+                unrealized_pnl_pct = (sell_lot["price"] / current_price - 1) * 100 if current_price and sell_lot["price"] else None
+                rts.append({
+                    'entry_date': sell_lot["date"],
+                    'exit_date': None,
+                    'entry_price': sell_lot["price"],
+                    'exit_price': None,
+                    'qty': sell_lot["qty"],
+                    'pnl': unrealized_pnl,
+                    'pnl_pct': unrealized_pnl_pct,
+                    'current_price': current_price,
+                    'exit_reason': 'OPEN',
+                    'side': 'SHORT',
                     'pool': "GUARDIAN" if symbol in GUARDIAN_ASSETS else "HUNTER"
                 })
 
@@ -320,6 +416,7 @@ def build_roundtrips_from_orders(filled_orders, positions):
             roundtrips[symbol] = rts
 
     return roundtrips
+
 
 def generate_trade_history_html(roundtrips, master_rows):
     """Generate accordion-based HTML for each stock's roundtrip trades + overall summary."""
@@ -440,9 +537,17 @@ def generate_trade_history_html(roundtrips, master_rows):
     def fmt_price(p):
         return f'${p:,.2f}' if p is not None else '—'
 
-    def fmt_pnl(pnl, pnl_pct):
-        if pnl is None:
+    def fmt_pnl(pnl, pnl_pct, exit_reason=''):
+        if exit_reason == 'OPEN':
+            if pnl is not None and pnl_pct is not None:
+                cls = 'pnl-pos' if pnl >= 0 else 'pnl-neg'
+                sign = '+' if pnl >= 0 else ''
+                return (f'<span class="pnl-open" style="font-style:italic;opacity:0.75;">'
+                        f'<span class="{cls}">{sign}${pnl:,.2f} ({sign}{pnl_pct:.1f}%)</span>'
+                        f' <span style="font-size:10px;color:#64748b;">unrealized</span></span>')
             return '<span class="pnl-open">OPEN</span>'
+        if pnl is None:
+            return '<span class="pnl-open">—</span>'
         cls = 'pnl-pos' if pnl >= 0 else 'pnl-neg'
         sign = '+' if pnl >= 0 else ''
         return f'<span class="{cls}">{sign}${pnl:,.2f} ({sign}{pnl_pct:.1f}%)</span>'
@@ -511,9 +616,9 @@ def generate_trade_history_html(roundtrips, master_rows):
             '<th>P&amp;L</th><th>Exit Reason</th></tr></thead><tbody>'
         )
 
-        closed = [r for r in rts if r['pnl'] is not None]
-        wins = [r for r in closed if r['pnl'] >= 0]
-        losses = [r for r in closed if r['pnl'] < 0]
+        closed = [r for r in rts if r['exit_reason'] != 'OPEN']
+        wins = [r for r in closed if r['pnl'] is not None and r['pnl'] >= 0]
+        losses = [r for r in closed if r['pnl'] is not None and r['pnl'] < 0]
         stops = [r for r in closed if 'Stop' in r['exit_reason']]
 
         for i, rt in enumerate(rts, 1):
@@ -526,7 +631,7 @@ def generate_trade_history_html(roundtrips, master_rows):
                 f'<td>{qty_str}</td>'
                 f'<td>{fmt_price(rt["entry_price"])}</td>'
                 f'<td>{fmt_price(rt["exit_price"])}</td>'
-                f'<td>{fmt_pnl(rt["pnl"], rt["pnl_pct"])}</td>'
+                f'<td>{fmt_pnl(rt["pnl"], rt["pnl_pct"], rt["exit_reason"])}</td>'
                 f'<td>{fmt_reason(rt["exit_reason"])}</td>'
                 f'</tr>'
             )
@@ -696,6 +801,12 @@ def generate_html(account_metrics, risk_metrics, trade_stats, positions_df, char
 
     daily_pl_class = "green" if account_metrics["daily_pl"] >= 0 else "red"
     mdd_class = "green" if risk_metrics["max_drawdown_pct"] >= -5 else "red"
+
+    # Sharpe display — guard against None (insufficient data)
+    if risk_metrics['sharpe'] is not None:
+        sharpe_display = f"{risk_metrics['sharpe']:.2f}"
+    else:
+        sharpe_display = "\u2014"
 
     total_closed = trade_stats["win_trades"] + trade_stats["loss_trades"]
     if total_closed == 0 and account_metrics["ongoing_trades"] > 0:
@@ -998,7 +1109,8 @@ def generate_html(account_metrics, risk_metrics, trade_stats, positions_df, char
         </div>
         <div class="card">
             <div class="card-label">Sharpe Ratio</div>
-            <div class="card-value text-blue">{risk_metrics['sharpe']:.2f}</div>
+            <div class="card-value text-blue">{sharpe_display}</div>
+            {'<div class="note" style="margin:4px 0 0;">Insufficient data</div>' if risk_metrics['sharpe'] is None else ''}
         </div>
         <div class="card">
             <div class="card-label">Max Drawdown</div>
@@ -1022,10 +1134,26 @@ def generate_html(account_metrics, risk_metrics, trade_stats, positions_df, char
                 <button class="tf-btn" data-tf="All">All</button>
             </div>
         </div>
-        <div class="chart-info">
-            <span class="eq-value" id="chartEqValue"></span>
-            <span class="eq-change" id="chartEqChange"></span>
-            <span class="eq-date" id="chartEqDate"></span>
+        <div class="chart-info" style="display: flex; justify-content: space-between; align-items: flex-end; flex-wrap: wrap; gap: 12px; margin-bottom: 8px;">
+            <div>
+                <span class="eq-value" id="chartEqValue"></span>
+                <span class="eq-change" id="chartEqChange"></span>
+                <span class="eq-date" id="chartEqDate"></span>
+            </div>
+            <div class="chart-legend" style="display: flex; gap: 16px; font-size: 11px; font-weight: 700; margin-bottom: 4px; text-transform: uppercase; letter-spacing: 0.05em;">
+                <div style="display: flex; align-items: center; gap: 6px;">
+                    <span style="display: inline-block; width: 12px; height: 3px; background: #10b981; border-radius: 2px;" id="legendPortColor"></span>
+                    <span style="color: #cbd5e1;">Portfolio</span>
+                </div>
+                <div style="display: flex; align-items: center; gap: 6px;">
+                    <span style="display: inline-block; width: 12px; height: 3px; background: #3b82f6; border-radius: 2px;"></span>
+                    <span style="color: #cbd5e1;">Nasdaq 100 (QQQ)</span>
+                </div>
+                <div style="display: flex; align-items: center; gap: 6px;">
+                    <span style="display: inline-block; width: 12px; height: 3px; background: #f59e0b; border-radius: 2px;"></span>
+                    <span style="color: #cbd5e1;">S&P 500 (SPY)</span>
+                </div>
+            </div>
         </div>
         <canvas id="equityCanvas"></canvas>
     </div>
@@ -1122,7 +1250,10 @@ def generate_html(account_metrics, risk_metrics, trade_stats, positions_df, char
     }}
 
     function draw(tf){{
-        var data=SERIES[tf]||[];
+        var tfData=SERIES[tf]||{{portfolio:[], qqq:[], spy:[]}};
+        var data = tfData.portfolio || [];
+        var qqqData = tfData.qqq || [];
+        var spyData = tfData.spy || [];
         var dpr=window.devicePixelRatio||1;
         var rect=canvas.getBoundingClientRect();
         canvas.width=rect.width*dpr; canvas.height=rect.height*dpr;
@@ -1148,13 +1279,22 @@ def generate_html(account_metrics, risk_metrics, trade_stats, positions_df, char
         chEl.className='eq-change '+(positive?'green':'red');
         dtEl.textContent=fmtDate(data[data.length-1][0],tf);
 
+        var legPortColor = document.getElementById('legendPortColor');
+        if(legPortColor){{
+            legPortColor.style.background = positive ? '#10b981' : '#f43f5e';
+        }}
+
         var vals=data.map(function(p){{ return p[1]; }});
-        var minV=Math.min.apply(null,vals), maxV=Math.max.apply(null,vals);
+        var allVals = vals.slice();
+        qqqData.forEach(function(p){{ allVals.push(p[1]); }});
+        spyData.forEach(function(p){{ allVals.push(p[1]); }});
+
+        var minV=Math.min.apply(null,allVals), maxV=Math.max.apply(null,allVals);
         var pad=10, range=maxV-minV||1;
         var yLabelW=60;
         var chartW=W-yLabelW-pad, chartH=H-pad*2;
 
-        function xPos(i){{ return yLabelW+(i/(data.length-1||1))*chartW; }}
+        function xPos(i, len){{ return yLabelW+(i/(len-1||1))*chartW; }}
         function yPos(v){{ return pad+chartH-(((v-minV)/range)*chartH); }}
 
         ctx.clearRect(0,0,W,H);
@@ -1170,27 +1310,44 @@ def generate_html(account_metrics, risk_metrics, trade_stats, positions_df, char
             ctx.fillText(fmtMoney(gv),yLabelW-6,gy+4);
         }}
 
-        // gradient fill
+        // gradient fill (portfolio only)
         var grad=ctx.createLinearGradient(0,pad,0,pad+chartH);
         if(positive){{
-            grad.addColorStop(0,'rgba(16, 185, 129, 0.18)');
+            grad.addColorStop(0,'rgba(16, 185, 129, 0.12)');
             grad.addColorStop(1,'rgba(16, 185, 129, 0.0)');
         }} else {{
-            grad.addColorStop(0,'rgba(244, 63, 94, 0.18)');
+            grad.addColorStop(0,'rgba(244, 63, 94, 0.12)');
             grad.addColorStop(1,'rgba(244, 63, 94, 0.0)');
         }}
         ctx.beginPath();
-        ctx.moveTo(xPos(0),yPos(data[0][1]));
-        for(var i=1;i<data.length;i++) ctx.lineTo(xPos(i),yPos(data[i][1]));
-        ctx.lineTo(xPos(data.length-1),pad+chartH);
-        ctx.lineTo(xPos(0),pad+chartH);
+        ctx.moveTo(xPos(0, data.length),yPos(data[0][1]));
+        for(var i=1;i<data.length;i++) ctx.lineTo(xPos(i, data.length),yPos(data[i][1]));
+        ctx.lineTo(xPos(data.length-1, data.length),pad+chartH);
+        ctx.lineTo(xPos(0, data.length),pad+chartH);
         ctx.closePath(); ctx.fillStyle=grad; ctx.fill();
 
-        // line
+        // draw indices first so they stay in background
+        // QQQ line
+        if(qqqData.length){{
+            ctx.beginPath();
+            ctx.moveTo(xPos(0, qqqData.length),yPos(qqqData[0][1]));
+            for(var i=1;i<qqqData.length;i++) ctx.lineTo(xPos(i, qqqData.length),yPos(qqqData[i][1]));
+            ctx.strokeStyle='#3b82f6'; ctx.lineWidth=1.5; ctx.stroke();
+        }}
+
+        // SPY line
+        if(spyData.length){{
+            ctx.beginPath();
+            ctx.moveTo(xPos(0, spyData.length),yPos(spyData[0][1]));
+            for(var i=1;i<spyData.length;i++) ctx.lineTo(xPos(i, spyData.length),yPos(spyData[i][1]));
+            ctx.strokeStyle='#f59e0b'; ctx.lineWidth=1.5; ctx.stroke();
+        }}
+
+        // line (portfolio on top)
         ctx.beginPath();
-        ctx.moveTo(xPos(0),yPos(data[0][1]));
-        for(var i=1;i<data.length;i++) ctx.lineTo(xPos(i),yPos(data[i][1]));
-        ctx.strokeStyle=positive?'#10b981':'#f43f5e'; ctx.lineWidth=2; ctx.stroke();
+        ctx.moveTo(xPos(0, data.length),yPos(data[0][1]));
+        for(var i=1;i<data.length;i++) ctx.lineTo(xPos(i, data.length),yPos(data[i][1]));
+        ctx.strokeStyle=positive?'#10b981':'#f43f5e'; ctx.lineWidth=2.5; ctx.stroke();
     }}
 
     btns.forEach(function(b){{
@@ -1353,19 +1510,27 @@ def main():
                 period=cfg["period"],
                 timeframe=cfg["timeframe"],
             )
-            chart_series[cfg["key"]] = history_to_js_array(hist)
+            portfolio_js = history_to_js_array(hist)
+            qqq_js, spy_js = get_comparison_data(hist, cfg["key"])
+            chart_series[cfg["key"]] = {
+                "portfolio": portfolio_js,
+                "qqq": qqq_js,
+                "spy": spy_js
+            }
             raw_histories[cfg["key"]] = hist
             if cfg["key"] == "All" and not hist.empty:
                 all_time_peak = float(hist["equity"].max())
         except Exception as exc:
             print(f"Warning: could not fetch {cfg['key']} history: {exc}")
-            chart_series[cfg["key"]] = []
+            chart_series[cfg["key"]] = {"portfolio": [], "qqq": [], "spy": []}
             raw_histories[cfg["key"]] = pd.DataFrame()
 
     history_all_df = raw_histories.get("All", pd.DataFrame())
     history_24h_df = raw_histories.get("1D", pd.DataFrame())
 
-    risk_metrics = calculate_risk_metrics(history_all_df)
+    daily_risk_free_rate = get_risk_free_rate()
+    print(f"Using risk-free rate: {daily_risk_free_rate * 252 * 100:.2f}% annualized")
+    risk_metrics = calculate_risk_metrics(history_all_df, daily_risk_free_rate)
     peak_equity_24h = (
         float(history_24h_df["equity"].max()) if not history_24h_df.empty else equity
     )
@@ -1407,20 +1572,18 @@ def main():
         if _safe_float(getattr(order, "filled_qty", 0.0)) > 0
         and _safe_float(getattr(order, "filled_avg_price", 0.0)) > 0
     ]
-    trade_stats = calculate_trade_statistics(filled_orders)
-
     # ── Master rows & trade history calculation ───────────────────────
     roundtrips = build_roundtrips_from_orders(filled_orders, positions)
     
     master_rows = []
     for symbol, rts in roundtrips.items():
         pool = rts[0].get('pool', '—') if rts else '—'
-        closed = [r for r in rts if r['pnl'] is not None]
-        wins = [r for r in closed if r['pnl'] >= 0]
-        losses = [r for r in closed if r['pnl'] < 0]
+        closed = [r for r in rts if r['exit_reason'] != 'OPEN']
+        wins = [r for r in closed if r['pnl'] is not None and r['pnl'] >= 0]
+        losses = [r for r in closed if r['pnl'] is not None and r['pnl'] < 0]
         stops = [r for r in closed if 'Stop' in r['exit_reason']]
-        n_open = sum(1 for r in rts if r['pnl'] is None)
-        total_pnl = sum(r['pnl'] for r in closed) if closed else 0.0
+        n_open = sum(1 for r in rts if r['exit_reason'] == 'OPEN')
+        total_pnl = sum(r['pnl'] for r in closed if r['pnl'] is not None) if closed else 0.0
         win_rate = (len(wins) / len(closed) * 100.0) if closed else 0.0
         master_rows.append({
             'symbol': symbol,
@@ -1434,6 +1597,17 @@ def main():
             'win_rate': win_rate,
             'total_pnl': total_pnl,
         })
+
+    # ── Trade statistics (derived from FIFO master_rows) ───────────────
+    grand_wins = sum(r['wins'] for r in master_rows)
+    grand_losses = sum(r['losses'] for r in master_rows)
+    closed_total = grand_wins + grand_losses
+    trade_stats = {
+        "win_trades": grand_wins,
+        "loss_trades": grand_losses,
+        "win_rate_pct": (grand_wins / closed_total * 100.0) if closed_total else 0.0,
+    }
+
 
     trade_history_html = generate_trade_history_html(roundtrips, master_rows)
 
