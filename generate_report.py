@@ -8,7 +8,6 @@ import requests
 from dotenv import load_dotenv
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import GetOrdersRequest, QueryOrderStatus
-import yfinance as yf
 
 
 load_dotenv()
@@ -43,11 +42,8 @@ HUNTER_ASSETS = [
 
 # ── Timeframe configs for chart ────────────────────────────────────────
 CHART_TIMEFRAMES = [
-    {"key": "1D", "period": "1D", "timeframe": "5Min"},
-    {"key": "1W", "period": "1W", "timeframe": "15Min"},
-    {"key": "1M", "period": "1M", "timeframe": "1D"},
-    {"key": "1Y", "period": "1A", "timeframe": "1D"},
     {"key": "All", "period": "all", "timeframe": "1D"},
+    {"key": "1D", "period": "1D", "timeframe": "5Min"},
 ]
 
 
@@ -112,108 +108,86 @@ def history_to_js_array(df):
     return records
 
 
-def get_comparison_data(portfolio_df, period_key):
-    """
-    Fetch QQQ and SPY close prices, align with portfolio_df, and scale them to start at portfolio's initial value.
-    Returns: (qqq_js_list, spy_js_list)
-    """
-    if portfolio_df.empty:
-        return [], []
-        
-    yf_mapping = {
-        "1D": {"period": "1d", "interval": "5m"},
-        "1W": {"period": "5d", "interval": "15m"},
-        "1M": {"period": "1mo", "interval": "1d"},
-        "1Y": {"period": "1y", "interval": "1d"},
-        "All": {"period": "max", "interval": "1d"},
+def fetch_benchmark_bars(api_key, secret_key, start, end):
+    """Fetch daily SPY and QQQ bars from Alpaca's IEX feed, following page tokens."""
+    endpoint = "https://data.alpaca.markets/v2/stocks/bars"
+    headers = {
+        "APCA-API-KEY-ID": api_key,
+        "APCA-API-SECRET-KEY": secret_key,
     }
-    
-    cfg = yf_mapping.get(period_key, {"period": "max", "interval": "1d"})
-    
-    try:
-        yf_df = yf.download(["QQQ", "SPY"], period=cfg["period"], interval=cfg["interval"], progress=False)
-        if yf_df.empty or "Close" not in yf_df.columns:
-            return [], []
-            
-        close_df = yf_df["Close"].copy()
-        close_df = close_df.reset_index()
-        
-        time_col = "Date" if "Date" in close_df.columns else "Datetime"
-        if time_col not in close_df.columns and len(close_df.columns) > 0:
-            time_col = close_df.columns[0]
-            
-        close_df = close_df.rename(columns={time_col: "timestamp"})
-        
-        if close_df["timestamp"].dt.tz is None:
-            close_df["timestamp"] = close_df["timestamp"].dt.tz_localize("UTC")
-        else:
-            close_df["timestamp"] = close_df["timestamp"].dt.tz_convert("UTC")
-            
-        close_df = close_df.sort_values("timestamp").reset_index(drop=True)
-        
-        merged = pd.merge_asof(portfolio_df, close_df, on="timestamp", direction="nearest")
-        
-        if "QQQ" in merged.columns:
-            merged["QQQ"] = merged["QQQ"].ffill().bfill()
-        if "SPY" in merged.columns:
-            merged["SPY"] = merged["SPY"].ffill().bfill()
-            
-        if "QQQ" not in merged.columns or "SPY" not in merged.columns:
-            return [], []
-            
-        P_0 = float(merged["equity"].iloc[0])
-        Q_0 = float(merged["QQQ"].iloc[0])
-        S_0 = float(merged["SPY"].iloc[0])
-        
-        qqq_records = []
-        spy_records = []
-        
-        # If first benchmark price is zero/missing, return empty for that benchmark
-        # instead of substituting portfolio equity (which would be misleading)
-        has_qqq = bool(Q_0)
-        has_spy = bool(S_0)
-        
-        if not has_qqq and not has_spy:
-            return [], []
-        
-        if has_qqq:
-            qqq_series = (merged["QQQ"] / Q_0) * P_0
-        if has_spy:
-            spy_series = (merged["SPY"] / S_0) * P_0
-        
-        for idx, row in merged.iterrows():
-            ts_ms = int(row["timestamp"].timestamp() * 1000)
-            if has_qqq:
-                qqq_records.append([ts_ms, round(float(qqq_series.iloc[idx]), 2)])
-            if has_spy:
-                spy_records.append([ts_ms, round(float(spy_series.iloc[idx]), 2)])
-            
-        return qqq_records, spy_records
+    params = {
+        "symbols": "SPY,QQQ",
+        "timeframe": "1Day",
+        "start": start,
+        "end": end,
+        "limit": 10000,
+        "adjustment": "all",
+        "feed": "iex",
+        "sort": "asc",
+    }
+    result = {"SPY": [], "QQQ": []}
 
-    except Exception as e:
-        print(f"Warning: Failed to fetch/align comparison data for {period_key}: {e}")
-        return [], []
+    while True:
+        response = requests.get(endpoint, headers=headers, params=params, timeout=30)
+        response.raise_for_status()
+        payload = response.json()
+        for symbol in result:
+            result[symbol].extend(payload.get("bars", {}).get(symbol, []))
+
+        page_token = payload.get("next_page_token")
+        if not page_token:
+            break
+        params["page_token"] = page_token
+
+    return result
 
 
-def get_risk_free_rate():
-    """
-    Fetch the current annualized risk-free rate using the 13-week T-bill yield
-    (^IRX, quoted by Yahoo Finance as an annualized percentage, e.g. 5.10 -> 5.10%).
-    Returns the DAILY risk-free rate as a decimal (e.g. 0.0002), using a 252
-    trading-day convention. Falls back to 0.0 on any failure so report
-    generation never breaks because of this.
-    """
-    try:
-        irx = yf.Ticker("^IRX").history(period="5d")
-        if irx.empty or "Close" not in irx.columns:
-            return 0.0
-        annual_rate_pct = float(irx["Close"].dropna().iloc[-1])
-        annual_rate = annual_rate_pct / 100.0
-        daily_rate = annual_rate / 252.0
-        return daily_rate
-    except Exception as exc:
-        print(f"Warning: could not fetch risk-free rate, defaulting to 0.0: {exc}")
-        return 0.0
+def normalize_benchmark_series(portfolio_history_df, bars_by_symbol):
+    """Scale each ETF close series to portfolio equity on its first common date."""
+    normalized = {"SPY": [], "QQQ": []}
+    if portfolio_history_df.empty:
+        return normalized
+
+    portfolio = portfolio_history_df[["timestamp", "equity"]].copy()
+    portfolio["date"] = portfolio["timestamp"].dt.date
+    portfolio = (
+        portfolio.groupby("date", as_index=False).last()
+        .sort_values("timestamp")
+        .reset_index(drop=True)
+    )
+
+    for symbol, bars in bars_by_symbol.items():
+        if not bars:
+            continue
+        benchmark = pd.DataFrame(
+            [{"timestamp": bar["t"], "close": bar["c"]} for bar in bars]
+        )
+        benchmark["timestamp"] = pd.to_datetime(benchmark["timestamp"], utc=True)
+        benchmark["close"] = pd.to_numeric(benchmark["close"], errors="coerce")
+        benchmark = benchmark.dropna(subset=["close"])
+        benchmark["date"] = benchmark["timestamp"].dt.date
+        benchmark = (
+            benchmark.groupby("date", as_index=False).last()
+            .sort_values("timestamp")
+            .reset_index(drop=True)
+        )
+        matched = portfolio.merge(benchmark[["date", "close"]], on="date", how="inner")
+        if matched.empty:
+            continue
+
+        initial_equity = float(matched.iloc[0]["equity"])
+        initial_close = float(matched.iloc[0]["close"])
+        if initial_close <= 0:
+            continue
+        normalized[symbol] = [
+            [
+                int(row["timestamp"].timestamp() * 1000),
+                round(float(row["close"]) / initial_close * initial_equity, 2),
+            ]
+            for _, row in matched.iterrows()
+        ]
+
+    return normalized
 
 
 def calculate_risk_metrics(daily_history_df, daily_risk_free_rate=0.0):
@@ -238,8 +212,6 @@ def calculate_risk_metrics(daily_history_df, daily_risk_free_rate=0.0):
     drawdowns = (equity - rolling_peak) / rolling_peak
     max_drawdown_pct = float(drawdowns.min() * 100.0)
     return {"sharpe": sharpe_ratio, "max_drawdown_pct": max_drawdown_pct}
-
-
 
 
 def build_roundtrips_from_orders(filled_orders, positions):
@@ -418,341 +390,6 @@ def build_roundtrips_from_orders(filled_orders, positions):
     return roundtrips
 
 
-def generate_trade_history_html(roundtrips, master_rows):
-    """Generate accordion-based HTML for each stock's roundtrip trades + overall summary."""
-    css = """
-    <style>
-        .th-section { margin-top: 32px; }
-        .th-header { font-size: 18px; font-weight: 600; margin-bottom: 16px; border-bottom: 2px solid #1e2d44; padding-bottom: 8px; color: #f8fafc; }
-        
-        details.stock-accordion {
-            margin-bottom: 10px;
-            border-radius: 6px;
-            overflow: hidden;
-            border: 1px solid #1d2d44;
-            background: #0e1622;
-        }
-        details.stock-accordion summary::-webkit-details-marker {
-            display: none;
-        }
-        details.stock-accordion summary {
-            list-style: none;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            padding: 14px 18px;
-            cursor: pointer;
-            user-select: none;
-            transition: all 0.2s;
-        }
-        details.stock-accordion summary:hover {
-            background: #162235;
-            border-color: #3b82f6;
-        }
-        details.stock-accordion[open] summary {
-            background: #162235;
-            border-bottom: 1px solid #1d2d44;
-        }
-        .accordion-content {
-            background: #090e17;
-            padding: 20px;
-        }
-        .acc-left {
-            display: flex;
-            align-items: center;
-            gap: 12px;
-        }
-        .acc-symbol {
-            font-size: 18px;
-            font-weight: 700;
-            color: #f8fafc;
-        }
-        .acc-badge {
-            font-size: 10px;
-            font-weight: 600;
-            padding: 2px 6px;
-            border-radius: 4px;
-            background: rgba(59, 130, 246, 0.12);
-            color: #3b82f6;
-            border: 1px solid rgba(59, 130, 246, 0.25);
-        }
-        .acc-right {
-            display: flex;
-            align-items: center;
-            gap: 32px;
-        }
-        .acc-pnl-wrap, .acc-wr-wrap, .acc-open-wrap {
-            display: flex;
-            flex-direction: column;
-            align-items: flex-end;
-        }
-        .acc-label {
-            font-size: 9px;
-            text-transform: uppercase;
-            letter-spacing: 0.05em;
-            color: #64748b;
-            margin-bottom: 3px;
-        }
-        .acc-val {
-            font-size: 14px;
-            font-weight: 600;
-        }
-        .chevron {
-            color: #64748b;
-            transition: transform 0.2s;
-            font-size: 11px;
-        }
-        details.stock-accordion[open] .chevron {
-            transform: rotate(90deg);
-        }
-        
-        .th-table-wrap { background: #0e1622; border: 1px solid #1d2d44; border-radius: 6px; overflow: hidden; margin-bottom: 16px; }
-        .th-table { width: 100%; border-collapse: collapse; }
-        .th-table th { background: #0a0f18; color: #cbd5e1; font-weight: 600; padding: 10px; text-align: left; font-size: 12px; white-space: nowrap; border-bottom: 1px solid #1d2d44; }
-        .th-table td { padding: 9px 10px; border-bottom: 1px solid #1d2d44; font-size: 13px; white-space: nowrap; color: #e2e8f0; }
-        .th-table tbody tr:hover { background: #162235; }
-        .pnl-pos { color: #10b981; font-weight: 600; }
-        .pnl-neg { color: #f43f5e; font-weight: 600; }
-        .pnl-open { color: #94a3b8; font-style: italic; }
-        .reason-badge { padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 500; display: inline-block; }
-        .reason-stop { background: rgba(244,63,94,0.12); color: #fca5a5; border: 1px solid rgba(244,63,94,0.25); }
-        .reason-exit { background: rgba(245,158,11,0.12); color: #fcd34d; border: 1px solid rgba(245,158,11,0.25); }
-        .reason-open { background: rgba(16,185,129,0.12); color: #86efac; border: 1px solid rgba(16,185,129,0.25); }
-        .summary-wrap { background: #0a0f18; padding: 12px; border-radius: 6px; border: 1px solid #1d2d44; }
-        .summary-table { width: 100%; border-collapse: collapse; }
-        .summary-table th { color: #64748b; font-size: 11px; text-align: center; padding: 4px; border: none; background: transparent; text-transform: uppercase; letter-spacing: 0.05em; }
-        .summary-table td { text-align: center; font-size: 13px; font-weight: 600; padding: 4px; border: none; }
-        .master-summary { margin-top: 40px; }
-        .master-table th { background: #0a0f18; color: #f8fafc; font-size: 12px; text-transform: uppercase; letter-spacing: 0.05em; }
-        .total-row td { background: #0e1622; font-weight: bold; border-top: 2px solid #1d2d44; color: #f8fafc; }
-    </style>
-    """
-
-    def fmt_date(d):
-        if not d: return '—'
-        if isinstance(d, datetime):
-            return d.strftime('%Y-%m-%d')
-        return str(d)[:10]
-
-    def fmt_price(p):
-        return f'${p:,.2f}' if p is not None else '—'
-
-    def fmt_pnl(pnl, pnl_pct, exit_reason=''):
-        if exit_reason == 'OPEN':
-            if pnl is not None and pnl_pct is not None:
-                cls = 'pnl-pos' if pnl >= 0 else 'pnl-neg'
-                sign = '+' if pnl >= 0 else ''
-                return (f'<span class="pnl-open" style="font-style:italic;opacity:0.75;">'
-                        f'<span class="{cls}">{sign}${pnl:,.2f} ({sign}{pnl_pct:.1f}%)</span>'
-                        f' <span style="font-size:10px;color:#64748b;">unrealized</span></span>')
-            return '<span class="pnl-open">OPEN</span>'
-        if pnl is None:
-            return '<span class="pnl-open">—</span>'
-        cls = 'pnl-pos' if pnl >= 0 else 'pnl-neg'
-        sign = '+' if pnl >= 0 else ''
-        return f'<span class="{cls}">{sign}${pnl:,.2f} ({sign}{pnl_pct:.1f}%)</span>'
-
-    def fmt_reason(reason):
-        tag_map = {
-            'Trailing Stop': ('📉 Trailing Stop', 'reason-stop'),
-            'Exit Signal': ('🔴 Exit Signal', 'reason-exit'),
-            'OPEN': ('🟢 Open', 'reason-open'),
-        }
-        label, cls = tag_map.get(reason, (reason, 'reason-exit'))
-        return f'<span class="reason-badge {cls}">{label}</span>'
-
-    html_parts = [css, '<div class="th-section">']
-    html_parts.append('<div class="th-header">Per-Stock Trade History</div>')
-
-    row_map = {r['symbol']: r for r in master_rows}
-
-    for symbol in sorted(roundtrips.keys()):
-        rts = roundtrips[symbol]
-        row_data = row_map.get(symbol, {})
-        
-        pool = rts[0].get('pool', '—') if rts else '—'
-        total_pnl = row_data.get('total_pnl', 0.0)
-        win_rate = row_data.get('win_rate', 0.0)
-        n_closed = row_data.get('closed', 0)
-        n_open = row_data.get('open', 0)
-        
-        pnl_cls = 'pnl-pos' if total_pnl >= 0 else 'pnl-neg'
-        pnl_sign = '+' if total_pnl >= 0 else ''
-        pnl_str = f"{pnl_sign}${total_pnl:,.2f}"
-        
-        wr_cls = 'pnl-pos' if win_rate >= 50 else ('pnl-neg' if n_closed > 0 else '')
-        wr_str = f"{win_rate:.0f}%" if n_closed > 0 else '—'
-
-        html_parts.append(f"""
-        <details class="stock-accordion">
-            <summary>
-                <div class="acc-left">
-                    <span class="chevron">▶</span>
-                    <span class="acc-symbol">{symbol}</span>
-                    <span class="acc-badge">{pool}</span>
-                </div>
-                <div class="acc-right">
-                    <div class="acc-pnl-wrap">
-                        <span class="acc-label">Net P&amp;L</span>
-                        <span class="acc-val {pnl_cls}">{pnl_str}</span>
-                    </div>
-                    <div class="acc-wr-wrap">
-                        <span class="acc-label">Win Rate</span>
-                        <span class="acc-val {wr_cls}">{wr_str}</span>
-                    </div>
-                    <div class="acc-open-wrap">
-                        <span class="acc-label">Trades</span>
-                        <span class="acc-val">{n_closed} closed {f'/ {n_open} open' if n_open > 0 else ''}</span>
-                    </div>
-                </div>
-            </summary>
-            <div class="accordion-content">
-        """)
-
-        html_parts.append('<div class="th-table-wrap"><table class="th-table">')
-        html_parts.append(
-            '<thead><tr><th>#</th><th>Entry Date</th><th>Exit Date</th>'
-            '<th>Qty</th><th>Entry Price</th><th>Exit Price</th>'
-            '<th>P&amp;L</th><th>Exit Reason</th></tr></thead><tbody>'
-        )
-
-        closed = [r for r in rts if r['exit_reason'] != 'OPEN']
-        wins = [r for r in closed if r['pnl'] is not None and r['pnl'] >= 0]
-        losses = [r for r in closed if r['pnl'] is not None and r['pnl'] < 0]
-        stops = [r for r in closed if 'Stop' in r['exit_reason']]
-
-        for i, rt in enumerate(rts, 1):
-            qty_str = f'{rt["qty"]:,.2f}' if rt['qty'] else '—'
-            html_parts.append(
-                f'<tr>'
-                f'<td>{i}</td>'
-                f'<td>{fmt_date(rt["entry_date"])}</td>'
-                f'<td>{fmt_date(rt["exit_date"])}</td>'
-                f'<td>{qty_str}</td>'
-                f'<td>{fmt_price(rt["entry_price"])}</td>'
-                f'<td>{fmt_price(rt["exit_price"])}</td>'
-                f'<td>{fmt_pnl(rt["pnl"], rt["pnl_pct"], rt["exit_reason"])}</td>'
-                f'<td>{fmt_reason(rt["exit_reason"])}</td>'
-                f'</tr>'
-            )
-
-        html_parts.append('</tbody></table></div>')
-
-        avg_win = sum(r['pnl'] for r in wins)/len(wins) if wins else 0
-        avg_loss = sum(r['pnl'] for r in losses)/len(losses) if losses else 0
-
-        html_parts.append('<div class="summary-wrap"><table class="summary-table">')
-        html_parts.append(
-            '<thead><tr><th>Closed</th><th>Wins</th><th>Losses</th>'
-            '<th>Stops</th><th>Open</th><th>Win Rate</th>'
-            '<th>Avg Win</th><th>Avg Loss</th><th>Net P&amp;L</th></tr></thead><tbody>'
-        )
-        pnl_cls = 'pnl-pos' if total_pnl >= 0 else 'pnl-neg'
-        pnl_sign = '+' if total_pnl >= 0 else ''
-        html_parts.append(
-            f'<tr>'
-            f'<td>{len(closed)}</td>'
-            f'<td class="pnl-pos">{len(wins)}</td>'
-            f'<td class="pnl-neg">{len(losses)}</td>'
-            f'<td>{len(stops)}</td>'
-            f'<td>{n_open}</td>'
-            f'<td class="{wr_cls}">{win_rate:.0f}%</td>'
-            f'<td class="pnl-pos">{fmt_price(avg_win)}</td>'
-            f'<td class="pnl-neg">{fmt_price(avg_loss)}</td>'
-            f'<td class="{pnl_cls}">{pnl_sign}${total_pnl:,.2f}</td>'
-            f'</tr>'
-        )
-        html_parts.append('</tbody></table></div></div></details>')
-
-    # --- Master Summary ---
-    html_parts.append('<div class="master-summary">')
-    html_parts.append('<div class="th-header">Overall Stock Summary Table</div>')
-    html_parts.append('<div class="th-table-wrap"><table class="th-table master-table">')
-    html_parts.append(
-        '<thead><tr><th>Stock</th><th>Pool</th><th>Total</th><th>Closed</th>'
-        '<th>Wins</th><th>Losses</th><th>Stops</th><th>Open</th>'
-        '<th>Win Rate</th><th>Net P&amp;L</th></tr></thead><tbody>'
-    )
-
-    grand_total = grand_closed = grand_wins = grand_losses = grand_stops = grand_open = 0
-    grand_pnl = 0.0
-
-    for row in sorted(master_rows, key=lambda r: r['total_pnl'], reverse=True):
-        wr_cls = 'pnl-pos' if row['win_rate'] >= 50 else ('pnl-neg' if row['closed'] > 0 else '')
-        pnl_cls = 'pnl-pos' if row['total_pnl'] >= 0 else 'pnl-neg'
-        pnl_sign = '+' if row['total_pnl'] >= 0 else ''
-        
-        html_parts.append(
-            f'<tr>'
-            f'<td><strong>{row["symbol"]}</strong></td>'
-            f'<td>{row["pool"]}</td>'
-            f'<td>{row["total"]}</td>'
-            f'<td>{row["closed"]}</td>'
-            f'<td class="pnl-pos">{row["wins"]}</td>'
-            f'<td class="pnl-neg">{row["losses"]}</td>'
-            f'<td>{row["stops"]}</td>'
-            f'<td>{row["open"]}</td>'
-            f'<td class="{wr_cls}">{row["win_rate"]:.0f}%</td>'
-            f'<td class="{pnl_cls}">{pnl_sign}${row["total_pnl"]:,.2f}</td>'
-            f'</tr>'
-        )
-        grand_total += row['total']
-        grand_closed += row['closed']
-        grand_wins += row['wins']
-        grand_losses += row['losses']
-        grand_stops += row['stops']
-        grand_open += row['open']
-        grand_pnl += row['total_pnl']
-
-    grand_wr = (grand_wins / grand_closed * 100) if grand_closed > 0 else 0
-    wr_cls = 'pnl-pos' if grand_wr >= 50 else 'pnl-neg'
-    pnl_cls = 'pnl-pos' if grand_pnl >= 0 else 'pnl-neg'
-    pnl_sign = '+' if grand_pnl >= 0 else ''
-    
-    html_parts.append(
-        f'<tr class="total-row">'
-        f'<td>TOTAL</td><td>&mdash;</td>'
-        f'<td>{grand_total}</td>'
-        f'<td>{grand_closed}</td>'
-        f'<td class="pnl-pos">{grand_wins}</td>'
-        f'<td class="pnl-neg">{grand_losses}</td>'
-        f'<td>{grand_stops}</td>'
-        f'<td>{grand_open}</td>'
-        f'<td class="{wr_cls}">{grand_wr:.0f}%</td>'
-        f'<td class="{pnl_cls}">{pnl_sign}${grand_pnl:,.2f}</td>'
-        f'</tr>'
-    )
-    
-    html_parts.append('</tbody></table></div></div></div>')
-    return '\n'.join(html_parts)
-
-
-def generate_equity_table_html(daily_history_df):
-    """Generate the daily performance heatmap container placeholder."""
-    html = '''
-    <div class="panel heatmap-panel" style="margin-top: 32px;">
-        <div class="th-header">Daily Returns Heatmap</div>
-        <div class="heatmap-wrapper">
-            <div id="heatmapGrid" class="heatmap-grid"></div>
-        </div>
-        <div class="heatmap-legend">
-            <span class="legend-text">Significant Loss</span>
-            <div class="legend-scale">
-                <div class="legend-cell" style="background: rgba(244, 63, 94, 0.95)"></div>
-                <div class="legend-cell" style="background: rgba(244, 63, 94, 0.65)"></div>
-                <div class="legend-cell" style="background: rgba(244, 63, 94, 0.35)"></div>
-                <div class="legend-cell" style="background: #1e293b"></div>
-                <div class="legend-cell" style="background: rgba(16, 185, 129, 0.35)"></div>
-                <div class="legend-cell" style="background: rgba(16, 185, 129, 0.65)"></div>
-                <div class="legend-cell" style="background: rgba(16, 185, 129, 0.95)"></div>
-            </div>
-            <span class="legend-text">Significant Profit</span>
-        </div>
-    </div>
-    '''
-    return html
-
-
 def build_positions_dataframe(positions):
     rows = []
     for position in positions:
@@ -788,703 +425,480 @@ def build_positions_dataframe(positions):
     return pd.DataFrame(rows)
 
 
-def fmt_money(value):
-    return f"${value:,.2f}"
-
-
-def fmt_pct(value):
-    return f"{value:+,.2f}%"
-
-
-def generate_html(account_metrics, risk_metrics, trade_stats, positions_df, chart_data_json, trade_history_html, equity_table_html, heatmap_data_json, master_rows):
+def generate_html(account_metrics, risk_metrics, trade_stats, positions_df, equity_data_json, benchmark_data_json, heatmap_data_json, roundtrips, master_rows, paper_mode):
     now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
-    daily_pl_class = "green" if account_metrics["daily_pl"] >= 0 else "red"
-    mdd_class = "green" if risk_metrics["max_drawdown_pct"] >= -5 else "red"
+    def usd(value):
+        value = _safe_float(value)
+        return ("-$" if value < 0 else "$") + f"{abs(value):,.2f}"
 
-    # Sharpe display — guard against None (insufficient data)
-    if risk_metrics['sharpe'] is not None:
-        sharpe_display = f"{risk_metrics['sharpe']:.2f}"
-    else:
-        sharpe_display = "\u2014"
+    def signed_usd(value):
+        value = _safe_float(value)
+        return ("-" if value < 0 else "+") + "$" + f"{abs(value):,.2f}"
+
+    def js_timestamp(value):
+        if value is None:
+            return 0
+        try:
+            timestamp = pd.Timestamp(value)
+            if pd.isna(timestamp):
+                return 0
+            if timestamp.tzinfo is None:
+                timestamp = timestamp.tz_localize("UTC")
+            else:
+                timestamp = timestamp.tz_convert("UTC")
+            return int(timestamp.timestamp() * 1000)
+        except (TypeError, ValueError, OverflowError):
+            return 0
+
+    trade_rows = []
+    for symbol, symbol_roundtrips in roundtrips.items():
+        for trade in symbol_roundtrips:
+            if trade.get("exit_reason") == "OPEN" or trade.get("pnl") is None:
+                continue
+            close_ms = js_timestamp(trade.get("exit_date"))
+            if not close_ms:
+                continue
+            entry_ms = js_timestamp(trade.get("entry_date")) or close_ms
+            trade_rows.append({
+                "sym": str(symbol),
+                "side": str(trade.get("side", "")),
+                "qty": _safe_float(trade.get("qty")),
+                "entry": _safe_float(trade.get("entry_price")),
+                "exit": _safe_float(trade.get("exit_price")),
+                "openT": entry_ms,
+                "closeT": close_ms,
+                "pnl": _safe_float(trade.get("pnl")),
+                "ret": _safe_float(trade.get("pnl_pct")) / 100.0,
+            })
+    trade_rows.sort(key=lambda trade: trade["closeT"], reverse=True)
+    trades_json = json.dumps(trade_rows, separators=(",", ":"))
+
+    symbols = sorted({trade["sym"] for trade in trade_rows})
+    symbols_json = json.dumps(symbols, separators=(",", ":"))
+
+    css = """
+    :root{--bg:#eef1f6;--panel:#fff;--line:#dfe4ec;--text:#141a26;--mute:#667186;--up:#0d8a76;--down:#d4452f;--accent:#3a4fd0;color-scheme:light;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+    @media(prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#0d121c;--panel:#151c2b;--line:#232d41;--text:#e6eaf3;--mute:#8793a9;--up:#3fc7a8;--down:#f0716b;--accent:#8ba5ff;color-scheme:dark}}
+    :root[data-theme="dark"]{--bg:#0d121c;--panel:#151c2b;--line:#232d41;--text:#e6eaf3;--mute:#8793a9;--up:#3fc7a8;--down:#f0716b;--accent:#8ba5ff;color-scheme:dark}
+    html{scroll-padding-top:env(safe-area-inset-top,0px)}
+    *{box-sizing:border-box}
+    body{margin:0;background:var(--bg);color:var(--text);font:14px/1.45 "IBM Plex Sans",system-ui,-apple-system,"Segoe UI",sans-serif;font-variant-numeric:tabular-nums}
+    .wrap{max-width:1280px;margin:0 auto;padding:20px 16px 40px}
+    header{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:16px}
+    h1{font-size:20px;font-weight:600;margin:0}
+    h2{font-size:14px;font-weight:600;margin:0 0 12px}
+    .sub{color:var(--mute);font-size:12px}
+    .hr{display:flex;align-items:center;gap:10px}
+    .pill{display:inline-flex;align-items:center;gap:6px;font-size:12px;padding:4px 10px;border:1px solid var(--line);border-radius:20px;background:var(--panel)}
+    .dot{width:7px;height:7px;border-radius:50%;background:var(--up)}
+    select,button{background:var(--panel);color:var(--text);border:1px solid var(--line);border-radius:6px;padding:6px 10px;font:inherit;cursor:pointer}
+    select:focus-visible,button:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+    .panel{background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:16px;min-width:0}
+    .mt{margin-top:14px}
+    .grid{display:grid;gap:14px;margin-top:14px}
+    .row{grid-template-columns:repeat(auto-fit,minmax(310px,1fr))}
+    .kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));border-bottom:1px solid var(--line);margin:-16px -16px 16px}
+    .kpis>div{padding:16px;border-right:1px solid var(--line)}
+    .kpis>div:last-child{border-right:0}
+    .big{font-size:26px;font-weight:600;line-height:1.2}
+    .up{color:var(--up)}.down{color:var(--down)}
+    .hd{display:flex;justify-content:space-between;align-items:center;gap:10px;margin-bottom:12px}
+    .hd h2{margin:0}
+    #chart{position:relative;height:320px}
+    .chart-toolbar{display:flex;flex-wrap:wrap;justify-content:space-between;align-items:center;gap:8px;margin:-2px 0 10px}
+    .compare-buttons{display:flex;flex-wrap:wrap;gap:5px}
+    .compare-btn{padding:5px 9px;font-size:11px;color:var(--mute)}
+    .compare-btn.active{background:var(--accent);border-color:var(--accent);color:#fff}
+    .chart-legend{display:flex;flex-wrap:wrap;align-items:center;gap:10px;font-size:11px;color:var(--mute)}
+    .legend-item{display:inline-flex;align-items:center;gap:5px}
+    .legend-swatch{width:12px;height:3px;border-radius:2px}
+    #compareNote{min-height:16px}
+    .tip{position:absolute;display:none;pointer-events:none;background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:6px 10px;font-size:12px;white-space:nowrap;box-shadow:0 4px 14px rgba(0,0,0,.18)}
+    .tip-date{display:block;margin-bottom:4px;color:var(--mute)}
+    .tip-line{display:flex;align-items:center;gap:6px;margin-top:3px}
+    .tip-line b{font-size:12px}.tip-line span{color:var(--text)}
+    .kv{display:flex;justify-content:space-between;gap:12px;padding:9px 0;border-bottom:1px solid var(--line)}
+    .kv:last-child{border-bottom:0}.kv span{color:var(--mute)}
+    .kv b .up{color:var(--up)}.kv b .down{color:var(--down)}
+    .kv b small{display:block;color:var(--mute);font-size:10px;font-weight:400}
+    .stats{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+    .split{height:8px;border-radius:4px;background:var(--down);margin-top:18px;overflow:hidden}
+    .split i{display:block;height:100%;background:var(--up)}
+    .scroll{overflow-x:auto}.tall{max-height:340px;overflow-y:auto}
+    table{width:100%;border-collapse:collapse;font-size:13px}
+    th{color:var(--mute);font-weight:500;text-align:right;white-space:nowrap;padding:8px 10px;border-bottom:1px solid var(--line);position:sticky;top:0;background:var(--panel)}
+    td{padding:8px 10px;text-align:right;border-bottom:1px solid var(--line);white-space:nowrap}
+    th:first-child,td:first-child{text-align:left}
+    tbody tr:last-child td{border-bottom:0}
+    #sum tbody tr{cursor:pointer}
+    #sum tbody tr:hover{background:color-mix(in srgb,var(--accent) 7%,transparent)}
+    tbody tr.sel{background:color-mix(in srgb,var(--accent) 13%,transparent)}
+    .tag{padding:2px 8px;border-radius:4px;font-size:11px;font-weight:600}
+    .tag.LONG{color:var(--up);background:color-mix(in srgb,var(--up) 16%,transparent)}
+    .tag.SHORT{color:var(--down);background:color-mix(in srgb,var(--down) 16%,transparent)}
+    .rk{color:var(--mute);display:inline-block;width:20px}
+    .bar{height:6px;min-width:90px;background:var(--line);border-radius:3px}.bar i{display:block;height:100%;border-radius:3px}
+    .heat{display:grid;grid-template-rows:repeat(5,22px);gap:4px;min-width:560px}
+    .heat i{border-radius:3px;background:var(--line)}
+    .heat i:hover{outline:2px solid var(--text)}
+    .heat b{font-size:11px;color:var(--mute);font-weight:400;align-self:center}
+    .lg i{display:inline-block;width:12px;height:12px;border-radius:3px;margin:0 2px;vertical-align:-2px}
+    .empty{padding:16px 10px;color:var(--mute);text-align:center}
+    @media(max-width:700px){
+      .wrap{padding:16px 12px 32px}
+      header{align-items:flex-start}
+      header>.sub{max-width:145px;text-align:right}
+      .row{grid-template-columns:minmax(0,1fr)}
+      #chart{height:260px}
+      .hd{align-items:flex-start}
+      .hd .sub{max-width:45%;text-align:right}
+      .chart-toolbar{align-items:flex-start;flex-direction:column}
+      .stats{gap:10px}
+    }
+    """
+
+    script = r"""
+    const $=s=>document.querySelector(s);
+    const EQ=__EQUITY_DATA__, BENCH=__BENCHMARK_DATA__, T=__TRADE_DATA__, HEAT=__HEAT_DATA__, SYMBOLS=__SYMBOLS__;
+    const fmt=n=>Number(n).toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2});
+    const usd=n=>(n<0?'-':'')+'$'+fmt(Math.abs(n));
+    const spl=n=>(n<0?'-':'+')+'$'+fmt(Math.abs(n));
+    const pct=n=>(n<0?'':'+')+Number(n).toFixed(2)+'%';
+    const cls=n=>n>=0?'up':'down';
+    const pc=n=>'<span class="'+cls(n)+'">'+spl(n)+'</span>';
+    const pp=n=>'<span class="'+cls(n)+'">'+pct(n)+'</span>';
+    const tag=s=>'<span class="tag '+s+'">'+s+'</span>';
+    const fx=n=>Number.isFinite(n)?Number(n).toFixed(2):'∞';
+    const fd=t=>new Date(t).toLocaleString('en-GB',{day:'2-digit',month:'short',hour:'2-digit',minute:'2-digit'});
+    const sum=a=>a.reduce((v,t)=>v+t.pnl,0);
+    const tbl=(h,r)=>'<table><thead><tr>'+h.map(x=>'<th>'+x+'</th>').join('')+'</tr></thead><tbody>'+r.map(c=>'<tr>'+c.map(x=>'<td>'+x+'</td>').join('')+'</tr>').join('')+'</tbody></table>';
+    const st=A=>{
+      const w=A.filter(t=>t.pnl>0),l=A.filter(t=>t.pnl<=0),gp=sum(w),gl=sum(l);
+      return {n:A.length,w:w.length,l:l.length,wr:A.length?w.length/A.length*100:0,gp,gl,net:gp+gl,pf:gl?gp/-gl:Infinity,best:A.length?Math.max(...A.map(t=>t.pnl)):0,worst:A.length?Math.min(...A.map(t=>t.pnl)):0};
+    };
+    const allStats=st(T);
+    const symbolStats=SYMBOLS.map(s=>({s,...st(T.filter(t=>t.sym===s))})).sort((a,b)=>b.net-a.net);
+    const seriesInfo={
+      bot:{label:'Bot',color:'var(--accent)',data:EQ},
+      spy:{label:'S&P 500 (SPY)',color:'#f59e0b',data:BENCH.SPY||[]},
+      qqq:{label:'Nasdaq 100 (QQQ)',color:'#3b82f6',data:BENCH.QQQ||[]}
+    };
+    const modeSeries={bot:['bot'],spy:['bot','spy'],qqq:['bot','qqq'],all:['bot','spy','qqq']};
+    let chartMode='bot';
+
+    const symOptions=['ALL',...SYMBOLS];
+    $('#pick').innerHTML=symOptions.map(s=>'<option value="'+s+'">'+(s==='ALL'?'All assets':s)+'</option>').join('');
+    let selected='ALL';
+    const selectedTrades=()=>selected==='ALL'?T:T.filter(t=>t.sym===selected);
+    function renderPerf(){
+      const periods=[['24H',1],['7D',7],['30D',30],['90D',90],['All time',Infinity]];
+      const rows=periods.map(([label,days])=>{
+        const cutoff=days===Infinity?-Infinity:Date.now()-days*864e5;
+        const s=st(selectedTrades().filter(t=>t.closeT>=cutoff));
+        return s.n?['<b>'+label+'</b>',s.n,s.wr.toFixed(0)+'%',pc(s.net),fx(s.pf),pc(s.best),pc(s.worst)]:['<b>'+label+'</b>',0,'-','-','-','-','-'];
+      });
+      $('#perf').innerHTML=tbl(['Period','Trades','Win Rate','Net P&amp;L','Profit Factor','Best Trade','Worst Trade'],rows);
+    }
+    function renderHistory(){
+      const trades=selectedTrades().slice(0,selected==='ALL'?40:60);
+      $('#hl').textContent=selected==='ALL'?'All assets, latest 40 trades':selected+', latest trades';
+      if(!trades.length){$('#hist').innerHTML='<div class="empty">No closed trades for this selection.</div>';return;}
+      $('#hist').innerHTML=tbl(['Closed','Symbol','Side','Qty','Entry','Exit','P&amp;L ($)','P&amp;L (%)','Held'],
+        trades.map(t=>[fd(t.closeT),'<b>'+t.sym+'</b>',tag(t.side),fmt(t.qty),usd(t.entry),usd(t.exit),pc(t.pnl),pp(t.ret*100),((t.closeT-t.openT)/36e5).toFixed(1)+'h']));
+    }
+    function renderSummary(){
+      const rows=symbolStats.map(x=>['<b>'+x.s+'</b>',x.n,x.wr.toFixed(0)+'%','<span class="up">'+usd(x.gp)+'</span>','<span class="down">'+usd(x.gl)+'</span>',pc(x.net),pc(x.n?x.net/x.n:0),fx(x.pf)]);
+      rows.push(['<b>Total</b>',allStats.n,allStats.wr.toFixed(0)+'%','<span class="up">'+usd(allStats.gp)+'</span>','<span class="down">'+usd(allStats.gl)+'</span>',pc(allStats.net),pc(allStats.n?allStats.net/allStats.n:0),fx(allStats.pf)]);
+      $('#sum').innerHTML=tbl(['Symbol','Trades','Win Rate','Gross Profit','Gross Loss','Net P&amp;L','Avg P&amp;L / Trade','Profit Factor'],rows);
+      const bodyRows=[...document.querySelectorAll('#sum tbody tr')];
+      bodyRows.forEach((tr,i)=>tr.onclick=()=>pick(i<symbolStats.length?symbolStats[i].s:'ALL'));
+    }
+    function mark(){document.querySelectorAll('#sum tbody tr').forEach((tr,i)=>tr.classList.toggle('sel',i<symbolStats.length&&symbolStats[i].s===selected));}
+    function pick(s){selected=s;$('#pick').value=s;renderPerf();renderHistory();mark();}
+    $('#pick').onchange=e=>pick(e.target.value);
+    renderSummary();pick('ALL');
+
+    function drawEquity(){
+      const el=$('#chart'),E=EQ;
+      if(!E.length){el.innerHTML='<div class="empty">No equity history was returned by Alpaca.</div>';return;}
+      const requested=modeSeries[chartMode];
+      const visible=requested.filter(key=>seriesInfo[key].data.length);
+      const missing=requested.filter(key=>key!=='bot'&&!seriesInfo[key].data.length);
+      $('#compareNote').textContent=missing.length?'Alpaca benchmark data unavailable for '+missing.map(key=>seriesInfo[key].label).join(' and ')+'.':'';
+      $('#chartLegend').innerHTML=visible.map(key=>'<span class="legend-item"><i class="legend-swatch" style="background:'+seriesInfo[key].color+'"></i>'+seriesInfo[key].label+'</span>').join('');
+      const W=el.clientWidth,H=el.clientHeight,m={l:62,r:12,t:10,b:24};
+      const x0=E[0][0],x1=E[E.length-1][0];
+      const activePoints=visible.flatMap(key=>seriesInfo[key].data);
+      let lo=Math.min(...activePoints.map(p=>p[1])),hi=Math.max(...activePoints.map(p=>p[1]));
+      if(hi===lo){hi+=1;lo-=1;}
+      const pad=(hi-lo)*.08;lo-=pad;hi+=pad;
+      const X=t=>m.l+(t-x0)/(x1-x0||1)*(W-m.l-m.r),Y=v=>m.t+(1-(v-lo)/(hi-lo))*(H-m.t-m.b);
+      const pathFor=data=>data.map((p,i)=>(i?'L':'M')+X(p[0]).toFixed(1)+' '+Y(p[1]).toFixed(1)).join('');
+      const botLine=pathFor(E);
+      const compareLines=visible.filter(key=>key!=='bot').map(key=>'<path d="'+pathFor(seriesInfo[key].data)+'" fill="none" stroke="'+seriesInfo[key].color+'" stroke-width="1.8" stroke-linejoin="round"/>').join('');
+      const markers=visible.map(key=>'<circle id="mark-'+key+'" r="4" fill="'+seriesInfo[key].color+'" stroke="var(--panel)" stroke-width="2" style="display:none"/>').join('');
+      let grid='';
+      for(let i=0;i<5;i++){const v=lo+(hi-lo)*i/4,y=Y(v).toFixed(1);grid+='<line x1="'+m.l+'" x2="'+(W-m.r)+'" y1="'+y+'" y2="'+y+'" stroke="var(--line)"/><text x="'+(m.l-8)+'" y="'+(+y+4)+'" text-anchor="end" fill="var(--mute)" font-size="11">'+usd(v)+'</text>';}
+      for(let i=0;i<5;i++){const t=x0+(x1-x0)*i/4;grid+='<text x="'+X(t).toFixed(1)+'" y="'+(H-6)+'" text-anchor="'+(i===0?'start':i===4?'end':'middle')+'" fill="var(--mute)" font-size="11">'+new Date(t).toLocaleDateString('en-GB',{day:'numeric',month:'short'})+'</text>';}
+      el.innerHTML='<svg width="'+W+'" height="'+H+'" style="display:block;touch-action:pan-y"><defs><linearGradient id="equity-fill" x1="0" y1="0" x2="0" y2="1"><stop offset="0" style="stop-color:var(--accent);stop-opacity:.25"/><stop offset="1" style="stop-color:var(--accent);stop-opacity:0"/></linearGradient></defs>'+grid+'<path d="'+botLine+'L'+X(x1)+' '+(H-m.b)+'L'+m.l+' '+(H-m.b)+'Z" fill="url(#equity-fill)"/>'+compareLines+'<path d="'+botLine+'" fill="none" stroke="var(--accent)" stroke-width="2.3" stroke-linejoin="round"/><line id="vl" y1="'+m.t+'" y2="'+(H-m.b)+'" stroke="var(--mute)" stroke-dasharray="3 3" style="display:none"/>'+markers+'</svg><div class="tip" id="tip"></div>';
+      const svg=el.firstChild,tip=$('#tip'),vl=svg.querySelector('#vl');
+      const closest=(data,t)=>{
+        if(!data.length)return null;
+        let a=0,b=data.length-1;while(a<b){const k=(a+b)>>1;data[k][0]<t?a=k+1:b=k;}
+        if(a>0&&Math.abs(data[a-1][0]-t)<Math.abs(data[a][0]-t))a--;
+        return data[a];
+      };
+      svg.onpointermove=e=>{
+        const t=x0+(e.clientX-svg.getBoundingClientRect().left-m.l)/(W-m.l-m.r)*(x1-x0);
+        const botPoint=closest(E,t),cx=X(botPoint[0]);
+        vl.setAttribute('x1',cx);vl.setAttribute('x2',cx);vl.style.display='';
+        let tooltip='<span class="tip-date">'+new Date(botPoint[0]).toLocaleString('en-GB',{weekday:'short',day:'numeric',month:'short',year:'numeric'})+'</span>';
+        visible.forEach(key=>{
+          const info=seriesInfo[key],point=closest(info.data,t),marker=svg.querySelector('#mark-'+key);
+          if(!point)return;
+          marker.setAttribute('cx',X(point[0]));marker.setAttribute('cy',Y(point[1]));marker.style.display='';
+          const change=(point[1]/info.data[0][1]-1)*100;
+          tooltip+='<div class="tip-line"><i class="legend-swatch" style="background:'+info.color+'"></i><b>'+info.label+'</b><span>'+usd(point[1])+'</span><strong class="'+cls(change)+'">'+pct(change)+'</strong></div>';
+        });
+        tip.innerHTML=tooltip;tip.style.display='block';
+        tip.style.left=Math.max(0,Math.min(cx+14,W-tip.offsetWidth))+'px';tip.style.top=Math.max(0,Math.min(Y(botPoint[1])-56,H-tip.offsetHeight))+'px';
+      };
+      svg.onpointerleave=()=>{vl.style.display=tip.style.display='none';svg.querySelectorAll('circle').forEach(mark=>mark.style.display='none');};
+    }
+    drawEquity();
+    window.addEventListener('resize',()=>requestAnimationFrame(drawEquity));
+    if(window.ResizeObserver)new ResizeObserver(()=>requestAnimationFrame(drawEquity)).observe($('#chart'));
+    document.querySelectorAll('.compare-btn').forEach(button=>button.addEventListener('click',()=>{
+      chartMode=button.dataset.mode;
+      document.querySelectorAll('.compare-btn').forEach(item=>{
+        const active=item===button;
+        item.classList.toggle('active',active);
+        item.setAttribute('aria-pressed',String(active));
+      });
+      requestAnimationFrame(drawEquity);
+    }));
+
+    (function drawHeatmap(){
+      const el=$('#heat');
+      if(!HEAT.length){el.innerHTML='<div class="empty">No daily returns were returned by Alpaca.</div>';return;}
+      const start=new Date(HEAT[0].date+'T00:00:00');start.setHours(0,0,0,0);start.setDate(start.getDate()-((start.getDay()+6)%7));
+      const positions=HEAT.map(d=>Math.round((new Date(d.date+'T00:00:00')-start)/864e5));
+      const maxAbs=Math.max(.0001,...HEAT.map(d=>Math.abs(d.change_pct)));
+      const weeks=Math.floor(positions[positions.length-1]/7)+1;
+      el.style.gridTemplateColumns='18px repeat('+weeks+',minmax(14px,1fr))';
+      el.innerHTML=['M','T','W','T','F'].map((day,i)=>'<b style="grid-row:'+(i+1)+';grid-column:1">'+day+'</b>').join('')+
+        HEAT.map((d,i)=>{
+          const p=positions[i],r=Number(d.change_pct)||0,opacity=Math.round(12+88*Math.abs(r)/maxAbs);
+          const color=r>=0?'--up':'--down';
+          const date=new Date(d.date+'T00:00:00').toLocaleDateString('en-GB',{weekday:'short',day:'numeric',month:'short'});
+          return '<i style="grid-row:'+(p%7+1)+';grid-column:'+(Math.floor(p/7)+2)+';background:color-mix(in srgb,var('+color+') '+opacity+'%,transparent)" title="'+date+': '+pct(r)+'"></i>';
+        }).join('');
+    })();
+
+    $('#th').onclick=()=>{
+      const root=document.documentElement;
+      const dark=root.dataset.theme?root.dataset.theme==='dark':matchMedia('(prefers-color-scheme:dark)').matches;
+      root.dataset.theme=dark?'light':'dark';
+      requestAnimationFrame(drawEquity);
+    };
+    """
+    script = (
+        script.replace("__EQUITY_DATA__", equity_data_json)
+        .replace("__BENCHMARK_DATA__", benchmark_data_json)
+        .replace("__TRADE_DATA__", trades_json)
+        .replace("__HEAT_DATA__", heatmap_data_json)
+        .replace("__SYMBOLS__", symbols_json)
+    )
+
+    daily_class = "up" if account_metrics["daily_pl"] >= 0 else "down"
+    daily_pct = (
+        account_metrics["daily_pl"] / account_metrics["last_close_equity"] * 100
+        if account_metrics["last_close_equity"] else 0.0
+    )
+    primary_metrics = [
+        ("Equity balance", usd(account_metrics["equity"]),
+         f'<span class="{daily_class}">{daily_pct:+.2f}%</span> vs last close'),
+        ("Sharpe ratio", f'{risk_metrics["sharpe"]:.2f}' if risk_metrics["sharpe"] is not None else "—",
+         "Annualised from daily returns"),
+        ("Max drawdown", f'<span class="down">{risk_metrics["max_drawdown_pct"]:.2f}%</span>',
+         "Peak to trough"),
+        ("Daily P&amp;L", f'<span class="{daily_class}">{signed_usd(account_metrics["daily_pl"])}</span>',
+         f'<span class="{daily_class}">{daily_pct:+.2f}%</span> today'),
+    ]
+    kpis_html = "".join(
+        f'<div><div class="sub">{label}</div><div class="big">{value}</div><div class="sub">{note}</div></div>'
+        for label, value, note in primary_metrics
+    )
+
+    def kv(label, value):
+        return f'<div class="kv"><span>{label}</span><b>{value}</b></div>'
+
+    snapshot_html = "".join([
+        kv("Cash", usd(account_metrics["cash"])),
+        kv("Last close equity", usd(account_metrics["last_close_equity"])),
+        kv("Equity balance", usd(account_metrics["equity"])),
+        kv("Peak equity (24H)", usd(account_metrics["peak_equity_24h"])),
+        kv("All-time peak equity", usd(account_metrics["all_time_peak"])),
+        kv("Open trades", account_metrics["ongoing_trades"]),
+    ])
+
+    daily_history = json.loads(heatmap_data_json)
+    daily_changes = daily_history[1:] if len(daily_history) > 1 else []
+    best_day = max(daily_changes, key=lambda day: day["change"], default=None)
+    worst_day = min(daily_changes, key=lambda day: day["change"], default=None)
+
+    def daily_day_value(day, color_class):
+        if day is None:
+            return "—"
+        return (
+            f'<span class="{color_class}">{signed_usd(day["change"])} '
+            f'({day["change_pct"]:+.2f}%)</span>'
+            f'<small>{day["date"]}</small>'
+        )
+
+    snapshot_html += "".join([
+        kv("Best trading day", daily_day_value(best_day, "up")),
+        kv("Worst trading day", daily_day_value(worst_day, "down")),
+    ])
 
     total_closed = trade_stats["win_trades"] + trade_stats["loss_trades"]
-    if total_closed == 0 and account_metrics["ongoing_trades"] > 0:
-        trade_note = (
-            '<p class="note">All current positions are still open &mdash; '
-            "trade stats update once a position is fully closed (buy &rarr; sell round-trip).</p>"
+    win_rate = trade_stats["win_rate_pct"]
+    trade_stats_html = (
+        '<div class="stats">'
+        f'<div><div class="sub">Win rate</div><div class="big">{win_rate:.1f}%</div></div>'
+        f'<div><div class="sub">Live trades</div><div class="big">{account_metrics["ongoing_trades"]}</div></div>'
+        f'<div><div class="sub">Winning trades</div><div class="big up">{trade_stats["win_trades"]}</div></div>'
+        f'<div><div class="sub">Losing trades</div><div class="big down">{trade_stats["loss_trades"]}</div></div>'
+        '</div>'
+        f'<div class="split"><i style="width:{win_rate:.2f}%"></i></div>'
+    )
+
+    closed_master_rows = [row for row in master_rows if row.get("closed", 0) > 0]
+    ranked_rows = sorted(closed_master_rows, key=lambda item: _safe_float(item.get("total_pnl")), reverse=True)
+    top_contributors = [row for row in ranked_rows if _safe_float(row.get("total_pnl")) > 0][:5]
+    top_detractors = [row for row in reversed(ranked_rows) if _safe_float(row.get("total_pnl")) < 0][:5]
+    visible_symbols = {row["symbol"] for row in top_contributors + top_detractors}
+    visible_rows = [(index, row) for index, row in enumerate(ranked_rows, 1) if row["symbol"] in visible_symbols]
+    if not visible_rows:
+        visible_rows = list(enumerate(ranked_rows[:5], 1))
+    max_abs_pnl = max((abs(_safe_float(row.get("total_pnl"))) for row in closed_master_rows), default=0.0) or 1.0
+    attribution_rows = []
+    for index, row in visible_rows:
+        pnl = _safe_float(row.get("total_pnl"))
+        bar_width = abs(pnl) / max_abs_pnl * 100.0
+        pnl_class = "up" if pnl >= 0 else "down"
+        bar_color = "--up" if pnl >= 0 else "--down"
+        attribution_rows.append(
+            f'<tr><td><span class="rk">{index}</span><b>{row["symbol"]}</b></td>'
+            f'<td><div class="bar"><i style="width:{bar_width:.1f}%;background:var({bar_color})"></i></div></td>'
+            f'<td><span class="{pnl_class}">{signed_usd(pnl)}</span></td></tr>'
         )
-    elif total_closed == 0:
-        trade_note = '<p class="note">No trades have been executed yet.</p>'
-    else:
-        trade_note = ""
+    if not attribution_rows:
+        attribution_rows.append('<tr><td colspan="3" class="empty">No closed trades yet.</td></tr>')
+    attribution_html = (
+        '<div class="sub">Top 5 contributors and detractors</div>'
+        '<table><thead><tr><th>Symbol</th><th>Contribution</th><th>Net P&amp;L</th></tr></thead>'
+        f'<tbody>{"".join(attribution_rows)}</tbody></table>'
+    )
 
-    # Position rows with unrealized P&L double-sided progress bar
-    position_rows = ""
-    if positions_df.empty:
-        position_rows = (
-            "<tr><td colspan='9' style='text-align:center;color:#94a3b8;'>"
-            "No Open Positions</td></tr>"
+    position_rows = []
+    for _, row in positions_df.iterrows():
+        side = str(row["side"]).upper()
+        side_class = "LONG" if side == "LONG" else "SHORT"
+        unrealized = _safe_float(row["unrealized_pl"])
+        raw_change = _safe_float(row["change_today"])
+        market_value = _safe_float(row["market_value"])
+        daily_change = market_value * (raw_change / 100.0) / (1.0 + raw_change / 100.0) if raw_change != -100 else 0.0
+        oriented_change = raw_change if side_class == "LONG" else -raw_change
+        side_html = f'<span class="tag {side_class}">{side}</span>'
+        unrealized_class = "up" if unrealized >= 0 else "down"
+        unrealized_pct = f'<span class="{unrealized_class}">{_safe_float(row["unrealized_plpc"]):+.2f}%</span>'
+        change_class = "up" if oriented_change >= 0 else "down"
+        position_rows.append(
+            f'<tr><td><b>{row["symbol"]}</b></td><td>{side_html}</td>'
+            f'<td>{_safe_float(row["qty"]):,.4f}</td><td>{usd(market_value)}</td>'
+            f'<td>{usd(row["avg_entry_price"])}</td><td>{usd(row["current_price"])}</td>'
+            f'<td><span class="{unrealized_class}">{signed_usd(unrealized)}</span></td><td>{unrealized_pct}</td>'
+            f'<td><span class="{change_class}">{signed_usd(daily_change)} ({oriented_change:+.2f}%)</span></td></tr>'
         )
-    else:
-        for _, row in positions_df.iterrows():
-            pl_class = "green" if row["unrealized_pl"] >= 0 else "red"
-            change_class = "green" if row["change_today"] >= 0 else "red"
-            
-            pnl_pc = row['unrealized_plpc']
-            clamped = max(-10.0, min(10.0, pnl_pc))
-            if clamped >= 0:
-                bar_class = "pos"
-                bar_width = (clamped / 10.0) * 50
-                bar_margin = 50
-            else:
-                bar_class = "neg"
-                bar_width = (abs(clamped) / 10.0) * 50
-                bar_margin = 50 - bar_width
-                
-            position_rows += f"""
-            <tr>
-                <td><strong>{row['symbol']}</strong></td>
-                <td><span class="side-badge">{row['side']}</span></td>
-                <td>{row['qty']:,.4f}</td>
-                <td>{fmt_money(row['market_value'])}</td>
-                <td>{fmt_money(row['avg_entry_price'])}</td>
-                <td>{fmt_money(row['current_price'])}</td>
-                <td class="{pl_class}">{fmt_money(row['unrealized_pl'])}</td>
-                <td class="{pl_class}">
-                    <div class="pnl-progress-flex">
-                        <span class="pnl-pc-text">{fmt_pct(row['unrealized_plpc'])}</span>
-                        <div class="pnl-progress-track">
-                            <div class="pnl-progress-bar {bar_class}" style="width: {bar_width:.1f}%; margin-left: {bar_margin:.1f}%;"></div>
-                            <div class="pnl-progress-center"></div>
-                        </div>
-                    </div>
-                </td>
-                <td class="{change_class}">{fmt_pct(row['change_today'])}</td>
-            </tr>
-            """
+    if not position_rows:
+        position_rows.append('<tr><td colspan="9" class="empty">No open positions.</td></tr>')
+    positions_html = (
+        '<table><thead><tr><th>Symbol</th><th>Side</th><th>Qty</th><th>Market Value</th>'
+        '<th>Avg Price</th><th>Current Price</th><th>Unrealized P&amp;L ($)</th>'
+        '<th>Unrealized P&amp;L (%)</th><th>Today’s Change</th></tr></thead>'
+        f'<tbody>{"".join(position_rows)}</tbody></table>'
+    )
 
-    # --- P&L Attribution Breakdown HTML ---
-    pos_stocks = [r for r in master_rows if r['total_pnl'] > 0]
-    total_gains = sum(r['total_pnl'] for r in pos_stocks)
-    
-    attribution_html = ""
-    if total_gains == 0:
-        attribution_html = '<p class="note">No positive closed P&L to attribute yet.</p>'
-    else:
-        sorted_pos = sorted(pos_stocks, key=lambda x: x['total_pnl'], reverse=True)
-        attribution_html += '<div class="attribution-list">'
-        for r in sorted_pos[:6]:
-            pct = (r['total_pnl'] / total_gains) * 100.0
-            attribution_html += f"""
-            <div class="attrib-row">
-                <div class="attrib-meta">
-                    <span class="attrib-sym"><strong>{r['symbol']}</strong></span>
-                    <span class="attrib-val green">+{fmt_money(r['total_pnl'])}</span>
-                </div>
-                <div class="attrib-progress-container">
-                    <div class="attrib-progress-bar" style="width: {pct:.1f}%"></div>
-                    <span class="attrib-pct">{pct:.1f}%</span>
-                </div>
-            </div>
-            """
-        if len(sorted_pos) > 6:
-            other_gains = sum(r['total_pnl'] for r in sorted_pos[6:])
-            other_pct = (other_gains / total_gains) * 100.0
-            attribution_html += f"""
-            <div class="attrib-row">
-                <div class="attrib-meta">
-                    <span class="attrib-sym"><strong>Others</strong></span>
-                    <span class="attrib-val green">+{fmt_money(other_gains)}</span>
-                </div>
-                <div class="attrib-progress-container">
-                    <div class="attrib-progress-bar" style="width: {other_pct:.1f}%; background: #475569;"></div>
-                    <span class="attrib-pct">{other_pct:.1f}%</span>
-                </div>
-            </div>
-            """
-        attribution_html += '</div>'
-
-    # --- Horizontal Stock Summary Bar Chart ---
-    sorted_master = sorted(master_rows, key=lambda x: x['total_pnl'], reverse=True)
-    max_abs_pnl = max(abs(r['total_pnl']) for r in master_rows) if master_rows else 1.0
-    if max_abs_pnl == 0.0:
-        max_abs_pnl = 1.0
-        
-    bar_chart_html = """
-    <div class="panel bar-chart-panel">
-        <h3>Asset Net P&amp;L Performance</h3>
-        <div class="bar-chart-container">
-    """
-    for r in sorted_master:
-        pnl = r['total_pnl']
-        pnl_pct_of_max = (abs(pnl) / max_abs_pnl) * 50.0
-        
-        pnl_val_str = f"+${pnl:,.2f}" if pnl >= 0 else f"-${abs(pnl):,.2f}"
-        pnl_class = "green" if pnl >= 0 else "red"
-        
-        if pnl >= 0:
-            bar_style = f"width: {pnl_pct_of_max:.1f}%; margin-left: 50%;"
-            bar_color_class = "bar-pos"
-        else:
-            bar_style = f"width: {pnl_pct_of_max:.1f}%; margin-left: {50.0 - pnl_pct_of_max:.1f}%;"
-            bar_color_class = "bar-neg"
-            
-        bar_chart_html += f"""
-        <div class="bar-chart-row">
-            <div class="bar-chart-label"><strong>{r['symbol']}</strong> <span class="bar-chart-pool">{r['pool']}</span></div>
-            <div class="bar-chart-track-wrap">
-                <div class="bar-chart-track">
-                    <div class="bar-chart-fill {bar_color_class}" style="{bar_style}"></div>
-                    <div class="bar-chart-grid-zero"></div>
-                </div>
-            </div>
-            <div class="bar-chart-value {pnl_class}">{pnl_val_str}</div>
-        </div>
-        """
-    bar_chart_html += """
-        </div>
-    </div>
-    """
-
-    win_rate_val = trade_stats['win_rate_pct']
-    win_dash = f"{win_rate_val:.2f}"
-    loss_dash = f"{100.0 - win_rate_val:.2f}"
-
-    html = f"""<!DOCTYPE html>
+    status = "Paper" if paper_mode else "Live"
+    return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
-    <!-- Google tag (gtag.js) -->
-    <script async src="https://www.googletagmanager.com/gtag/js?id=G-4MRR5QJQXN"></script>
-    <script>
-      window.dataLayer = window.dataLayer || [];
-      function gtag(){{dataLayer.push(arguments);}}
-      gtag('js', new Date());
-      gtag('config', 'G-4MRR5QJQXN');
-    </script>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Trading Bot Dashboard</title>
-    <style>
-        *{{ box-sizing:border-box; }}
-        body{{ margin:0; background:#060b13; color:#f8fafc; font-family:Inter,Segoe UI,Arial,sans-serif; -webkit-font-smoothing: antialiased; }}
-        .container{{ max-width:1280px; margin:0 auto; padding:24px; }}
-        .header{{ margin-bottom:24px; display:flex; justify-content:space-between; align-items:flex-end; border-bottom: 1px solid #1d2d44; padding-bottom: 16px; }}
-        .title{{ margin:0; font-size:26px; font-weight: 800; letter-spacing: -0.02em; color: #f8fafc; }}
-        .subtitle{{ margin:4px 0 0; color:#64748b; font-size:12px; font-weight: 500; text-transform: uppercase; letter-spacing: 0.05em; }}
-        
-        /* ── KPI Cards ── */
-        .cards{{ display:grid; grid-template-columns:repeat(4,minmax(180px,1fr)); gap:16px; margin-bottom:24px; }}
-        .card{{ background:#0e1622; border:1px solid #1d2d44; border-radius:8px; padding:18px 20px; display:flex; flex-direction:column; justify-content:space-between; transition:all 0.2s; }}
-        .card:hover {{ border-color: #3b82f6; transform: translateY(-2px); }}
-        .card-label{{ color:#64748b; font-size:11px; font-weight:600; text-transform:uppercase; letter-spacing:.07em; margin-bottom: 8px; }}
-        .card-value{{ font-size:32px; font-weight:800; color:#f8fafc; line-height:1.1; }}
-        
-        .green{{ color:#10b981 !important; }} 
-        .red{{ color:#f43f5e !important; }} 
-        .text-blue{{ color:#3b82f6 !important; }}
-        
-        /* ── Sections Grid ── */
-        .sections{{ display:grid; grid-template-columns:1fr 1.1fr 0.9fr; gap:16px; margin-bottom:24px; }}
-        .panel{{ background:#0e1622; border:1px solid #1d2d44; border-radius:8px; padding:18px; }}
-        .panel h3{{ margin:0 0 16px; font-size:15px; font-weight:700; text-transform:uppercase; letter-spacing:0.05em; color: #94a3b8; border-bottom: 1px solid #1d2d44; padding-bottom: 8px; }}
-        
-        /* ── Snapshot Panel ── */
-        .stats-grid{{ display:grid; grid-template-columns:repeat(2,minmax(100px,1fr)); gap:12px; }}
-        .stat-box{{ background:#090e17; border:1px solid #1d2d44; border-radius:6px; padding:12px 14px; }}
-        .stat-box.full-width {{ grid-column: span 2; }}
-        .stat-box .label {{ font-size: 10px; color: #64748b; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 4px; }}
-        .stat-box .value {{ font-size: 18px; font-weight: 700; color: #f8fafc; }}
-        
-        /* ── Trade Stats Donut ── */
-        .trade-stats-container {{ display: flex; align-items: center; gap: 20px; }}
-        .donut-chart-wrap {{ width: 120px; height: 120px; flex-shrink: 0; position: relative; }}
-        .donut-svg {{ transform: rotate(-90deg); width: 100%; height: 100%; }}
-        .donut-center-pct {{ fill: #f8fafc; font-size: 6px; font-weight: 800; text-anchor: middle; transform: rotate(90deg); transform-origin: center; }}
-        .donut-center-sub {{ fill: #64748b; font-size: 2px; font-weight: 600; text-anchor: middle; transform: rotate(90deg); transform-origin: center; text-transform: uppercase; letter-spacing: 0.05em; }}
-        .trade-stats-details {{ flex-grow: 1; display: flex; flex-direction: column; gap: 8px; }}
-        .stat-row {{ display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #162235; padding-bottom: 4px; }}
-        .stat-row:last-child {{ border-bottom: none; }}
-        .stat-row .stat-label {{ font-size: 12px; color: #94a3b8; }}
-        .stat-row .stat-val {{ font-size: 13px; font-weight: 700; }}
-        
-        /* ── P&L Attribution Breakdown ── */
-        .attribution-list {{ display: flex; flex-direction: column; gap: 10px; }}
-        .attrib-row {{ display: flex; flex-direction: column; gap: 4px; }}
-        .attrib-meta {{ display: flex; justify-content: space-between; font-size: 12px; }}
-        .attrib-sym {{ color: #e2e8f0; }}
-        .attrib-val {{ font-weight: 600; }}
-        .attrib-progress-container {{ display: flex; align-items: center; gap: 8px; }}
-        .attrib-progress-bar {{ height: 5px; background: #10b981; border-radius: 3px; }}
-        .attrib-pct {{ font-size: 11px; color: #64748b; font-weight: 600; flex-shrink: 0; width: 32px; text-align: right; }}
-        
-        /* ── Position Table Double-Sided P&L Progress Bar ── */
-        .pnl-progress-flex {{ display: flex; align-items: center; gap: 12px; width: 100%; }}
-        .pnl-pc-text {{ font-size: 13px; font-weight: 700; width: 55px; text-align: right; flex-shrink: 0; }}
-        .pnl-progress-track {{ height: 6px; background: #1a2436; border-radius: 3px; flex-grow: 1; position: relative; overflow: hidden; display: flex; align-items: center; border: 1px solid #1d2d44; }}
-        .pnl-progress-bar {{ height: 100%; border-radius: 2px; }}
-        .pnl-progress-bar.pos {{ background: #10b981; }}
-        .pnl-progress-bar.neg {{ background: #f43f5e; }}
-        .pnl-progress-center {{ position: absolute; left: 50%; top: 0; bottom: 0; width: 1px; background: #64748b; opacity: 0.8; }}
-        .side-badge {{ padding: 2px 6px; border-radius: 4px; font-size: 11px; font-weight: 700; background: rgba(59, 130, 246, 0.15); color: #3b82f6; border: 1px solid rgba(59, 130, 246, 0.3); }}
-        
-        /* ── Horizontal Bar Chart ── */
-        .bar-chart-panel {{ background:#0e1622; border:1px solid #1d2d44; border-radius:8px; padding:18px; }}
-        .bar-chart-container {{ display: flex; flex-direction: column; gap: 10px; margin-top: 12px; }}
-        .bar-chart-row {{ display: flex; align-items: center; gap: 16px; height: 26px; }}
-        .bar-chart-label {{ font-size: 12px; color: #f8fafc; width: 90px; flex-shrink: 0; text-align: left; display: flex; align-items: center; gap: 6px; }}
-        .bar-chart-pool {{ font-size: 8px; color: #64748b; background: #1e293b; padding: 1px 4px; border-radius: 3px; font-weight: normal; }}
-        .bar-chart-track-wrap {{ flex-grow: 1; height: 100%; display: flex; align-items: center; }}
-        .bar-chart-track {{ height: 14px; background: #0a0f18; border: 1px solid #1d2d44; border-radius: 3px; flex-grow: 1; position: relative; overflow: hidden; }}
-        .bar-chart-fill {{ height: 100%; border-radius: 2px; transition: width 0.3s ease; }}
-        .bar-chart-fill.bar-pos {{ background: linear-gradient(90deg, rgba(16, 185, 129, 0.6), rgba(16, 185, 129, 0.95)); }}
-        .bar-chart-fill.bar-neg {{ background: linear-gradient(90deg, rgba(244, 63, 94, 0.95), rgba(244, 63, 94, 0.6)); }}
-        .bar-chart-grid-zero {{ position: absolute; left: 50%; top: 0; bottom: 0; width: 1px; background: #64748b; z-index: 2; }}
-        .bar-chart-value {{ font-size: 12px; font-weight: 700; width: 85px; text-align: right; flex-shrink: 0; }}
-        
-        /* ── Calendar Performance Heatmap ── */
-        .heatmap-panel {{ background:#0e1622; border:1px solid #1d2d44; border-radius:8px; padding:18px; }}
-        .heatmap-wrapper {{ position: relative; margin-top: 24px; overflow-x: auto; }}
-        .heatmap-grid {{ display: inline-block; min-width: 100%; padding-top: 20px; }}
-        .heatmap-grid-inner {{ display: flex; gap: 6px; }}
-        .heatmap-cols-wrap {{ display: flex; gap: 3px; position: relative; }}
-        .heatmap-week-col {{ display: flex; flex-direction: column; gap: 3px; }}
-        .heatmap-cell {{ width: 11px; height: 11px; background: #090e17; border: 1px solid #162235; border-radius: 2px; cursor: pointer; position: relative; }}
-        .heatmap-cell:hover {{ border-color: #3b82f6 !important; transform: scale(1.15); z-index: 5; }}
-        .heatmap-cell.empty-cell {{ background: transparent; border: none; cursor: default; pointer-events: none; }}
-        .heatmap-day-labels {{ display: flex; flex-direction: column; gap: 3px; font-size: 9px; color: #64748b; justify-content: space-between; padding-right: 6px; height: 95px; width: 28px; text-align: left; text-transform: uppercase; font-weight: 600; }}
-        .heatmap-months-labels {{ position: absolute; top: -18px; left: 34px; right: 0; height: 16px; font-size: 10px; color: #64748b; text-transform: uppercase; font-weight: 600; letter-spacing: 0.05em; }}
-        .heatmap-legend {{ display: flex; justify-content: flex-end; align-items: center; gap: 8px; margin-top: 16px; font-size: 11px; color: #64748b; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; }}
-        .legend-scale {{ display: flex; gap: 2px; }}
-        .legend-cell {{ width: 10px; height: 10px; border-radius: 1px; }}
-        .heatmap-tooltip {{ position: absolute; background: #0a0f18; border: 1px solid #3b82f6; border-radius: 4px; padding: 8px 12px; color: #f8fafc; font-size: 12px; pointer-events: none; opacity: 0; transition: opacity 0.15s ease; z-index: 100; box-shadow: 0 4px 12px rgba(0,0,0,0.5); line-height: 1.4; }}
-        
-        /* ── Chart ── */
-        .chart-panel{{ background:#0e1622; border:1px solid #1d2d44; border-radius:8px; padding:18px; margin-bottom:24px; }}
-        .chart-header{{ display:flex; justify-content:space-between; align-items:center; margin-bottom:16px; flex-wrap:wrap; gap:8px; border-bottom: 1px solid #1d2d44; padding-bottom: 8px; }}
-        .chart-header h3{{ margin:0; font-size:15px; font-weight:700; text-transform:uppercase; letter-spacing:0.05em; color:#94a3b8; }}
-        .tf-buttons{{ display:flex; gap:6px; }}
-        .tf-btn{{ background:#090e17; color:#64748b; border:1px solid #1d2d44; border-radius:4px; padding:5px 12px; cursor:pointer; font-size:11px; font-weight:700; transition:all .15s; text-transform:uppercase; }}
-        .tf-btn:hover{{ background:#162235; color:#e2e8f0; border-color: #3b82f6; }}
-        .tf-btn.active{{ background:#3b82f6; color:#fff; border-color:#3b82f6; }}
-        .chart-info{{ margin-bottom:8px; }}
-        .chart-info .eq-value{{ font-size:24px; font-weight:800; color:#f8fafc; }}
-        .chart-info .eq-change{{ font-size:14px; margin-left:8px; font-weight:700; }}
-        .chart-info .eq-date{{ display:block; color:#64748b; font-size:11px; margin-top:4px; text-transform: uppercase; font-weight: 500; letter-spacing: 0.05em; }}
-        #equityCanvas{{ width:100%; height:260px; display:block; }}
-        
-        /* ── Table & Layout ── */
-        .table-wrap{{ background:#0e1622; border:1px solid #1d2d44; border-radius:8px; overflow:hidden; margin-bottom:24px; }}
-        table{{ width:100%; border-collapse:collapse; }}
-        thead{{ background:#0a0f18; }}
-        th,td{{ padding:12px 14px; border-bottom:1px solid #1d2d44; font-size:13px; text-align:left; white-space:nowrap; }}
-        th{{ color:#cbd5e1; font-weight:600; text-transform:uppercase; letter-spacing:0.05em; font-size:12px; }}
-        tbody tr:hover{{ background:#162235; }}
-        
-        .note{{ color:#64748b; font-size:12px; font-style:italic; margin:8px 0 0; line-height: 1.4; }}
-        
-        @media(max-width:1024px){{
-            .cards{{ grid-template-columns:repeat(2,minmax(180px,1fr)); }}
-            .sections{{ grid-template-columns:1fr; }}
-        }}
-    </style>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="description" content="Project Aegis Trading bot">
+<title>Project Aegis Trading bot</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<style>{css}</style>
 </head>
 <body>
-<div class="container">
-    <div class="header">
-        <div>
-            <h1 class="title">Trading Bot Performance Dashboard</h1>
-            <p class="subtitle">Live Performance Report</p>
-        </div>
-        <div style="text-align: right; color:#64748b; font-size:11px; font-weight:700; text-transform:uppercase; letter-spacing:0.05em;">
-            Last Updated: <span style="color:#f8fafc;">{now_utc}</span>
-        </div>
+<div class="wrap">
+<header>
+  <div><h1>Project Aegis Trading bot</h1><div class="sub">Alpaca account performance · Updated {now_utc}</div></div>
+  <div class="hr"><span class="pill"><i class="dot"></i>{status}</span><button id="th" aria-label="Toggle light or dark theme">Theme</button></div>
+</header>
+
+<section class="panel">
+  <div class="kpis" id="kpis">{kpis_html}</div>
+  <h2>Equity curve</h2>
+  <div class="chart-toolbar">
+    <div class="compare-buttons" role="group" aria-label="Choose performance comparison">
+      <button class="compare-btn active" type="button" data-mode="bot" aria-pressed="true">Bot only</button>
+      <button class="compare-btn" type="button" data-mode="spy" aria-pressed="false">Bot + S&amp;P 500</button>
+      <button class="compare-btn" type="button" data-mode="qqq" aria-pressed="false">Bot + Nasdaq 100</button>
+      <button class="compare-btn" type="button" data-mode="all" aria-pressed="false">All 3</button>
     </div>
+    <div id="chartLegend" class="chart-legend" aria-live="polite"></div>
+  </div>
+  <div id="compareNote" class="sub" aria-live="polite"></div>
+  <div id="chart" role="img" aria-label="Alpaca portfolio equity history"></div>
+</section>
 
-    <!-- ── Top cards ── -->
-    <div class="cards">
-        <div class="card">
-            <div class="card-label">Balance (Equity)</div>
-            <div class="card-value">{fmt_money(account_metrics['equity'])}</div>
-        </div>
-        <div class="card">
-            <div class="card-label">Sharpe Ratio</div>
-            <div class="card-value text-blue">{sharpe_display}</div>
-            {'<div class="note" style="margin:4px 0 0;">Insufficient data</div>' if risk_metrics['sharpe'] is None else ''}
-        </div>
-        <div class="card">
-            <div class="card-label">Max Drawdown</div>
-            <div class="card-value {mdd_class}">{risk_metrics['max_drawdown_pct']:.2f}%</div>
-        </div>
-        <div class="card">
-            <div class="card-label">Daily P/L</div>
-            <div class="card-value {daily_pl_class}">{fmt_money(account_metrics['daily_pl'])}</div>
-        </div>
-    </div>
+<section class="grid row">
+  <div class="panel"><h2>Account snapshot</h2><div id="snap">{snapshot_html}</div></div>
+  <div class="panel"><h2>Trade stats</h2><div id="tstats">{trade_stats_html}</div></div>
+  <div class="panel"><h2>P&amp;L attribution</h2><div id="attr" class="scroll">{attribution_html}</div></div>
+</section>
 
-    <!-- ── Equity chart ── -->
-    <div class="chart-panel">
-        <div class="chart-header">
-            <h3>Portfolio Equity Trend</h3>
-            <div class="tf-buttons">
-                <button class="tf-btn active" data-tf="1D">1D</button>
-                <button class="tf-btn" data-tf="1W">1W</button>
-                <button class="tf-btn" data-tf="1M">1M</button>
-                <button class="tf-btn" data-tf="1Y">1Y</button>
-                <button class="tf-btn" data-tf="All">All</button>
-            </div>
-        </div>
-        <div class="chart-info" style="display: flex; justify-content: space-between; align-items: flex-end; flex-wrap: wrap; gap: 12px; margin-bottom: 8px;">
-            <div>
-                <span class="eq-value" id="chartEqValue"></span>
-                <span class="eq-change" id="chartEqChange"></span>
-                <span class="eq-date" id="chartEqDate"></span>
-            </div>
-            <div class="chart-legend" style="display: flex; gap: 16px; font-size: 11px; font-weight: 700; margin-bottom: 4px; text-transform: uppercase; letter-spacing: 0.05em;">
-                <div style="display: flex; align-items: center; gap: 6px;">
-                    <span style="display: inline-block; width: 12px; height: 3px; background: #10b981; border-radius: 2px;" id="legendPortColor"></span>
-                    <span style="color: #cbd5e1;">Portfolio</span>
-                </div>
-                <div style="display: flex; align-items: center; gap: 6px;">
-                    <span style="display: inline-block; width: 12px; height: 3px; background: #3b82f6; border-radius: 2px;"></span>
-                    <span style="color: #cbd5e1;">Nasdaq 100 (QQQ)</span>
-                </div>
-                <div style="display: flex; align-items: center; gap: 6px;">
-                    <span style="display: inline-block; width: 12px; height: 3px; background: #f59e0b; border-radius: 2px;"></span>
-                    <span style="color: #cbd5e1;">S&P 500 (SPY)</span>
-                </div>
-            </div>
-        </div>
-        <canvas id="equityCanvas"></canvas>
-    </div>
+<section class="panel mt"><h2>Open positions</h2><div class="scroll" id="pos">{positions_html}</div></section>
 
-    <!-- ── Three Column Visual Section ── -->
-    <div class="sections">
-        <!-- Col 1: Account Snapshot -->
-        <div class="panel">
-            <h3>Account Snapshot</h3>
-            <div class="stats-grid">
-                <div class="stat-box"><div class="label">Cash</div><div class="value">{fmt_money(account_metrics['cash'])}</div></div>
-                <div class="stat-box"><div class="label">Last Close Equity</div><div class="value">{fmt_money(account_metrics['last_close_equity'])}</div></div>
-                <div class="stat-box"><div class="label">Peak Equity (24H)</div><div class="value">{fmt_money(account_metrics['peak_equity_24h'])}</div></div>
-                <div class="stat-box"><div class="label">All-Time Peak Equity</div><div class="value green">{fmt_money(account_metrics['all_time_peak'])}</div></div>
-                <div class="stat-box full-width"><div class="label">Active Ongoing Trades</div><div class="value text-blue">{account_metrics['ongoing_trades']}</div></div>
-            </div>
-        </div>
-        
-        <!-- Col 2: Trade Statistics with Donut Chart -->
-        <div class="panel">
-            <h3>Trade Statistics</h3>
-            <div class="trade-stats-container">
-                <div class="donut-chart-wrap">
-                    <svg class="donut-svg" viewBox="0 0 36 36">
-                        <circle cx="18" cy="18" r="15.915" fill="none" stroke="#f43f5e" stroke-width="3"></circle>
-                        <circle cx="18" cy="18" r="15.915" fill="none" stroke="#10b981" stroke-width="3"
-                                stroke-dasharray="{win_dash} {loss_dash}" stroke-dashoffset="25"></circle>
-                        <text x="18" y="16.5" class="donut-center-pct">{trade_stats['win_rate_pct']:.1f}%</text>
-                        <text x="18" y="22.5" class="donut-center-sub">Win Rate</text>
-                    </svg>
-                </div>
-                <div class="trade-stats-details">
-                    <div class="stat-row">
-                        <span class="stat-label">Winning Trades</span>
-                        <span class="stat-val green">{trade_stats['win_trades']}</span>
-                    </div>
-                    <div class="stat-row">
-                        <span class="stat-label">Losing Trades</span>
-                        <span class="stat-val red">{trade_stats['loss_trades']}</span>
-                    </div>
-                    <div class="stat-row">
-                        <span class="stat-label">Total Closed</span>
-                        <span class="stat-val">{total_closed}</span>
-                    </div>
-                </div>
-            </div>
-            {trade_note}
-        </div>
+<section class="panel mt">
+  <div class="hd"><h2>Asset net P&amp;L performance</h2><select id="pick" aria-label="Choose a ticker"></select></div>
+  <div class="scroll" id="perf"></div>
+</section>
 
-        <!-- Col 3: P&L Attribution Breakdown -->
-        <div class="panel">
-            <h3>P&amp;L Attribution (Gains)</h3>
-            {attribution_html}
-        </div>
-    </div>
+<section class="panel mt">
+  <div class="hd"><h2>Per-stock trade history</h2><span class="sub" id="hl"></span></div>
+  <div class="scroll tall" id="hist"></div>
+</section>
 
-    <!-- ── Positions table ── -->
-    <div class="table-wrap">
-        <table style="width: 100%;">
-            <thead><tr>
-                <th>Symbol</th><th>Side</th><th>Qty</th>
-                <th>Market Value</th><th>Avg Price</th><th>Current Price</th>
-                <th>Unrealized P&amp;L ($)</th><th>Unrealized P&amp;L (%)</th><th>Today&#39;s Change</th>
-            </tr></thead>
-            <tbody>{position_rows}</tbody>
-        </table>
-    </div>
+<section class="panel mt">
+  <div class="hd"><h2>Overall stock summary</h2><span class="sub">Select a row to focus that ticker above</span></div>
+  <div class="scroll tall" id="sum"></div>
+</section>
 
-    <!-- ── Visual Bar Chart ── -->
-    {bar_chart_html}
-
-    <!-- ── Trade History Accordions ── -->
-    {trade_history_html}
-
-    <!-- ── Daily Performance Heatmap ── -->
-    {equity_table_html}
+<section class="panel mt">
+  <div class="hd"><h2>Daily returns heatmap</h2>
+    <span class="sub lg">Loss <i style="background:color-mix(in srgb,var(--down) 90%,transparent)"></i><i style="background:color-mix(in srgb,var(--down) 40%,transparent)"></i><i style="background:color-mix(in srgb,var(--up) 40%,transparent)"></i><i style="background:color-mix(in srgb,var(--up) 90%,transparent)"></i> Profit</span></div>
+  <div class="scroll"><div class="heat" id="heat"></div></div>
+</section>
 </div>
-
-<!-- ── Chart JS (vanilla, zero dependencies) ── -->
-<script>
-(function(){{
-    var SERIES = {chart_data_json};
-    var canvas = document.getElementById('equityCanvas');
-    var ctx    = canvas.getContext('2d');
-    var btns   = document.querySelectorAll('.tf-btn');
-    var curTF  = '1D';
-
-    function fmtMoney(v){{ return '$' + v.toFixed(2).replace(/\\B(?=(\\d{{3}})+(?!\\d))/g, ','); }}
-    function fmtPct(v){{ return (v>=0?'+':'')+v.toFixed(2)+'%'; }}
-    function fmtDate(ms, tf){{
-        var d=new Date(ms);
-        if(tf==='1D') return d.toLocaleTimeString([],{{hour:'2-digit',minute:'2-digit'}});
-        return d.toLocaleDateString([],{{month:'short',day:'numeric',year:'numeric'}});
-    }}
-
-    function draw(tf){{
-        var tfData=SERIES[tf]||{{portfolio:[], qqq:[], spy:[]}};
-        var data = tfData.portfolio || [];
-        var qqqData = tfData.qqq || [];
-        var spyData = tfData.spy || [];
-        var dpr=window.devicePixelRatio||1;
-        var rect=canvas.getBoundingClientRect();
-        canvas.width=rect.width*dpr; canvas.height=rect.height*dpr;
-        ctx.scale(dpr,dpr);
-        var W=rect.width, H=rect.height;
-
-        // info
-        var eqEl=document.getElementById('chartEqValue');
-        var chEl=document.getElementById('chartEqChange');
-        var dtEl=document.getElementById('chartEqDate');
-        if(!data.length){{
-            ctx.clearRect(0,0,W,H);
-            ctx.fillStyle='#64748b'; ctx.font='14px sans-serif';
-            ctx.fillText('No data for this timeframe',W/2-80,H/2);
-            eqEl.textContent=''; chEl.textContent=''; dtEl.textContent='';
-            return;
-        }}
-        var first=data[0][1], last=data[data.length-1][1];
-        var pctChg=(last-first)/first*100;
-        var positive=pctChg>=0;
-        eqEl.textContent=fmtMoney(last);
-        chEl.textContent=fmtPct(pctChg);
-        chEl.className='eq-change '+(positive?'green':'red');
-        dtEl.textContent=fmtDate(data[data.length-1][0],tf);
-
-        var legPortColor = document.getElementById('legendPortColor');
-        if(legPortColor){{
-            legPortColor.style.background = positive ? '#10b981' : '#f43f5e';
-        }}
-
-        var vals=data.map(function(p){{ return p[1]; }});
-        var allVals = vals.slice();
-        qqqData.forEach(function(p){{ allVals.push(p[1]); }});
-        spyData.forEach(function(p){{ allVals.push(p[1]); }});
-
-        var minV=Math.min.apply(null,allVals), maxV=Math.max.apply(null,allVals);
-        var pad=10, range=maxV-minV||1;
-        var yLabelW=60;
-        var chartW=W-yLabelW-pad, chartH=H-pad*2;
-
-        function xPos(i, len){{ return yLabelW+(i/(len-1||1))*chartW; }}
-        function yPos(v){{ return pad+chartH-(((v-minV)/range)*chartH); }}
-
-        ctx.clearRect(0,0,W,H);
-
-        // grid lines + y labels
-        ctx.strokeStyle='#1d2d44'; ctx.lineWidth=0.5;
-        ctx.fillStyle='#64748b'; ctx.font='11px sans-serif'; ctx.textAlign='right';
-        var gridN=4;
-        for(var g=0;g<=gridN;g++){{
-            var gv=minV+(range/gridN)*g;
-            var gy=yPos(gv);
-            ctx.beginPath(); ctx.moveTo(yLabelW,gy); ctx.lineTo(W-pad,gy); ctx.stroke();
-            ctx.fillText(fmtMoney(gv),yLabelW-6,gy+4);
-        }}
-
-        // gradient fill (portfolio only)
-        var grad=ctx.createLinearGradient(0,pad,0,pad+chartH);
-        if(positive){{
-            grad.addColorStop(0,'rgba(16, 185, 129, 0.12)');
-            grad.addColorStop(1,'rgba(16, 185, 129, 0.0)');
-        }} else {{
-            grad.addColorStop(0,'rgba(244, 63, 94, 0.12)');
-            grad.addColorStop(1,'rgba(244, 63, 94, 0.0)');
-        }}
-        ctx.beginPath();
-        ctx.moveTo(xPos(0, data.length),yPos(data[0][1]));
-        for(var i=1;i<data.length;i++) ctx.lineTo(xPos(i, data.length),yPos(data[i][1]));
-        ctx.lineTo(xPos(data.length-1, data.length),pad+chartH);
-        ctx.lineTo(xPos(0, data.length),pad+chartH);
-        ctx.closePath(); ctx.fillStyle=grad; ctx.fill();
-
-        // draw indices first so they stay in background
-        // QQQ line
-        if(qqqData.length){{
-            ctx.beginPath();
-            ctx.moveTo(xPos(0, qqqData.length),yPos(qqqData[0][1]));
-            for(var i=1;i<qqqData.length;i++) ctx.lineTo(xPos(i, qqqData.length),yPos(qqqData[i][1]));
-            ctx.strokeStyle='#3b82f6'; ctx.lineWidth=1.5; ctx.stroke();
-        }}
-
-        // SPY line
-        if(spyData.length){{
-            ctx.beginPath();
-            ctx.moveTo(xPos(0, spyData.length),yPos(spyData[0][1]));
-            for(var i=1;i<spyData.length;i++) ctx.lineTo(xPos(i, spyData.length),yPos(spyData[i][1]));
-            ctx.strokeStyle='#f59e0b'; ctx.lineWidth=1.5; ctx.stroke();
-        }}
-
-        // line (portfolio on top)
-        ctx.beginPath();
-        ctx.moveTo(xPos(0, data.length),yPos(data[0][1]));
-        for(var i=1;i<data.length;i++) ctx.lineTo(xPos(i, data.length),yPos(data[i][1]));
-        ctx.strokeStyle=positive?'#10b981':'#f43f5e'; ctx.lineWidth=2.5; ctx.stroke();
-    }}
-
-    btns.forEach(function(b){{
-        b.addEventListener('click',function(){{
-            btns.forEach(function(x){{ x.classList.remove('active'); }});
-            b.classList.add('active');
-            curTF=b.getAttribute('data-tf');
-            draw(curTF);
-        }});
-    }});
-
-    window.addEventListener('resize',function(){{ draw(curTF); }});
-    draw(curTF);
-}})();
-
-// ── Heatmap JS (vanilla, zero dependencies) ──
-(function(){{
-    var data = {heatmap_data_json};
-    var container = document.getElementById('heatmapGrid');
-    if(!container || !data.length) return;
-
-    var dataMap = {{}};
-    var maxVal = 0.1;
-    data.forEach(function(d){{
-        dataMap[d.date] = d;
-        if(Math.abs(d.change_pct) > maxVal) {{
-            maxVal = Math.abs(d.change_pct);
-        }}
-    }});
-
-    var dates = data.map(function(d){{ return new Date(d.date + 'T00:00:00'); }});
-    var minDate = new Date(Math.min.apply(null, dates));
-    var maxDate = new Date(Math.max.apply(null, dates));
-
-    // Sunday align
-    var startDate = new Date(minDate);
-    startDate.setDate(startDate.getDate() - startDate.getDay());
-
-    // Saturday align
-    var endDate = new Date(maxDate);
-    endDate.setDate(endDate.getDate() + (6 - endDate.getDay()));
-
-    var tempDate = new Date(startDate);
-    var weeksCount = Math.ceil((endDate - startDate) / (7 * 24 * 60 * 60 * 1000));
-    
-    var colsHtml = '';
-    var currentMonth = -1;
-    var monthsLabelHtml = '<div class="heatmap-months-labels">';
-    var weekColWidth = 14; 
-    
-    for (var w = 0; w < weeksCount; w++) {{
-        var colHtml = '<div class="heatmap-week-col">';
-        
-        for (var d = 0; d < 7; d++) {{
-            var dateStr = tempDate.toISOString().split('T')[0];
-            var dayData = dataMap[dateStr];
-            
-            var cellStyle = '';
-            var cellClass = 'heatmap-cell';
-            var tooltipText = tempDate.toLocaleDateString([], {{month:'short', day:'numeric', year:'numeric'}}) + ' (No Trading)';
-            
-            if (dayData) {{
-                var changePct = dayData.change_pct;
-                var positive = changePct >= 0;
-                var intensity = maxVal > 0 ? Math.min(1.0, Math.max(0.18, Math.abs(changePct) / maxVal)) : 0.5;
-                
-                if (changePct === 0) {{
-                    cellStyle = 'background: #1e293b;';
-                }} else if (positive) {{
-                    cellStyle = 'background: rgba(16, 185, 129, ' + intensity.toFixed(2) + '); border: 1px solid rgba(16, 185, 129, ' + (intensity * 0.4).toFixed(2) + ');';
-                }} else {{
-                    cellStyle = 'background: rgba(244, 63, 94, ' + intensity.toFixed(2) + '); border: 1px solid rgba(244, 63, 94, ' + (intensity * 0.4).toFixed(2) + ');';
-                }}
-                
-                tooltipText = '<strong>' + tempDate.toLocaleDateString([], {{month:'short', day:'numeric', year:'numeric'}}) + '</strong><br/>' +
-                              'Equity: <strong>$' + dayData.equity.toLocaleString(undefined, {{minimumFractionDigits:2, maximumFractionDigits:2}}) + '</strong><br/>' +
-                              'Change: <strong class="' + (positive ? 'green' : 'red') + '">' + 
-                              (positive ? '+' : '') + dayData.change.toLocaleString(undefined, {{minimumFractionDigits:2, maximumFractionDigits:2}}) + 
-                              ' (' + (positive ? '+' : '') + changePct.toFixed(2) + '%)</strong>';
-                
-                cellClass += ' active-cell';
-            }} else {{
-                cellClass += ' empty-cell';
-            }}
-            
-            colHtml += '<div class="' + cellClass + '" style="' + cellStyle + '" data-tooltip="' + encodeURIComponent(tooltipText) + '"></div>';
-            
-            if (tempDate.getDay() === 0 && tempDate.getDate() <= 7) {{
-                var m = tempDate.getMonth();
-                if (m !== currentMonth) {{
-                    currentMonth = m;
-                    var monthName = tempDate.toLocaleDateString([], {{month:'short'}});
-                    monthsLabelHtml += '<span style="position: absolute; left: ' + ((w * weekColWidth) + 34) + 'px;">' + monthName + '</span>';
-                }}
-            }}
-            
-            tempDate.setDate(tempDate.getDate() + 1);
-        }}
-        
-        colHtml += '</div>';
-        colsHtml += colHtml;
-    }}
-    
-    monthsLabelHtml += '</div>';
-    
-    var dayLabelsHtml = '<div class="heatmap-day-labels">' +
-                        '<span>Sun</span><span></span><span>Tue</span><span></span><span>Thu</span><span></span><span>Sat</span>' +
-                        '</div>';
-                        
-    container.innerHTML = monthsLabelHtml + '<div class="heatmap-grid-inner">' + dayLabelsHtml + '<div class="heatmap-cols-wrap">' + colsHtml + '</div>' + '</div>';
-
-    // Tooltips
-    var tooltip = document.createElement('div');
-    tooltip.className = 'heatmap-tooltip';
-    document.body.appendChild(tooltip);
-    
-    var activeCells = container.querySelectorAll('.active-cell');
-    activeCells.forEach(function(cell){{
-        cell.addEventListener('mouseover', function(e){{
-            var text = decodeURIComponent(cell.getAttribute('data-tooltip'));
-            tooltip.innerHTML = text;
-            tooltip.style.opacity = 1;
-        }});
-        cell.addEventListener('mousemove', function(e){{
-            tooltip.style.left = (e.pageX + 12) + 'px';
-            tooltip.style.top = (e.pageY - 20) + 'px';
-        }});
-        cell.addEventListener('mouseout', function(e){{
-            tooltip.style.opacity = 0;
-        }});
-    }});
-}})();
-</script>
+<script>{script}</script>
 </body>
 </html>"""
-    return html
-
 
 def main():
     if not ALPACA_API_KEY or not ALPACA_SECRET_KEY:
@@ -1498,10 +912,11 @@ def main():
     last_close_equity = _safe_float(getattr(account, "last_equity", 0.0), default=equity)
     daily_pl = equity - last_close_equity
 
-    chart_series = {}
     raw_histories = {}
     all_time_peak = equity  # fallback
-    for cfg in CHART_TIMEFRAMES:
+    timeframe_by_key = {cfg["key"]: cfg for cfg in CHART_TIMEFRAMES}
+    for key in ("All", "1D"):
+        cfg = timeframe_by_key[key]
         try:
             hist = fetch_portfolio_history(
                 ALPACA_API_KEY,
@@ -1510,27 +925,17 @@ def main():
                 period=cfg["period"],
                 timeframe=cfg["timeframe"],
             )
-            portfolio_js = history_to_js_array(hist)
-            qqq_js, spy_js = get_comparison_data(hist, cfg["key"])
-            chart_series[cfg["key"]] = {
-                "portfolio": portfolio_js,
-                "qqq": qqq_js,
-                "spy": spy_js
-            }
-            raw_histories[cfg["key"]] = hist
-            if cfg["key"] == "All" and not hist.empty:
+            raw_histories[key] = hist
+            if key == "All" and not hist.empty:
                 all_time_peak = float(hist["equity"].max())
         except Exception as exc:
-            print(f"Warning: could not fetch {cfg['key']} history: {exc}")
-            chart_series[cfg["key"]] = {"portfolio": [], "qqq": [], "spy": []}
-            raw_histories[cfg["key"]] = pd.DataFrame()
+            print(f"Warning: could not fetch {key} Alpaca history: {exc}")
+            raw_histories[key] = pd.DataFrame()
 
     history_all_df = raw_histories.get("All", pd.DataFrame())
     history_24h_df = raw_histories.get("1D", pd.DataFrame())
 
-    daily_risk_free_rate = get_risk_free_rate()
-    print(f"Using risk-free rate: {daily_risk_free_rate * 252 * 100:.2f}% annualized")
-    risk_metrics = calculate_risk_metrics(history_all_df, daily_risk_free_rate)
+    risk_metrics = calculate_risk_metrics(history_all_df)
     peak_equity_24h = (
         float(history_24h_df["equity"].max()) if not history_24h_df.empty else equity
     )
@@ -1609,8 +1014,6 @@ def main():
     }
 
 
-    trade_history_html = generate_trade_history_html(roundtrips, master_rows)
-
     account_metrics = {
         "equity": equity,
         "cash": cash,
@@ -1621,7 +1024,23 @@ def main():
         "ongoing_trades": ongoing_trades,
     }
 
-    chart_data_json = json.dumps(chart_series)
+    equity_history = history_all_df if not history_all_df.empty else history_24h_df
+    chart_data_json = json.dumps(history_to_js_array(equity_history), separators=(",", ":"))
+    benchmark_data = {"SPY": [], "QQQ": []}
+    if not equity_history.empty:
+        history_start = equity_history["timestamp"].min() - pd.Timedelta(days=3)
+        history_end = equity_history["timestamp"].max() + pd.Timedelta(days=2)
+        try:
+            benchmark_bars = fetch_benchmark_bars(
+                ALPACA_API_KEY,
+                ALPACA_SECRET_KEY,
+                history_start.isoformat(),
+                history_end.isoformat(),
+            )
+            benchmark_data = normalize_benchmark_series(equity_history, benchmark_bars)
+        except Exception as exc:
+            print(f"Warning: could not fetch Alpaca SPY/QQQ comparison bars: {exc}")
+    benchmark_data_json = json.dumps(benchmark_data, separators=(",", ":"))
     
     # ── Heatmap & Daily equity calculations ─────────────────────────────
     heatmap_data = []
@@ -1629,6 +1048,8 @@ def main():
         df = history_all_df.copy()
         df = df.sort_values('timestamp').reset_index(drop=True)
         df['equity'] = df['equity'].astype(float)
+        df['date'] = df['timestamp'].dt.strftime('%Y-%m-%d')
+        df = df.groupby('date', as_index=False).tail(1).sort_values('timestamp').reset_index(drop=True)
         df['daily_change'] = df['equity'].diff()
         df['daily_change_pct'] = df['equity'].pct_change() * 100
         for _, row in df.iterrows():
@@ -1642,18 +1063,17 @@ def main():
             })
     heatmap_data_json = json.dumps(heatmap_data)
 
-    equity_table_html = generate_equity_table_html(history_all_df)
-
     html = generate_html(
         account_metrics, 
         risk_metrics, 
         trade_stats, 
         positions_df, 
         chart_data_json,
-        trade_history_html,
-        equity_table_html,
+        benchmark_data_json,
         heatmap_data_json,
-        master_rows
+        roundtrips,
+        master_rows,
+        ALPACA_PAPER,
     )
 
     output_path = os.path.join(REPORT_DIR, "index.html")
